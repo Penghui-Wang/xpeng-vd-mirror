@@ -50,6 +50,24 @@
 
 58.6 已经贴着这块屏的上限（60Hz 刷新 + 采集端 vsync 对齐），再往上没有意义。
 
+### 剥离自绘 UI 后的复测
+
+把接收端里的卡片绘制（`sprite` / `loadCards` / `//go:embed` 三张 PNG）和
+`localmap` / `split` / `jbench` / `fbput` 四个子命令全部拆掉、二进制从 3.40MB
+降到 2.36MB 之后，重新推上仪表复测：
+
+```
+车机  VDS| fps=62 cap=8590 proc=8590 sent=8322 bytes/s=7917462 procMs=7
+仪表  frames=7860 59.9fps (recv 550x384) read=1.08ms dec=7.10ms draw=4.15ms flush=3.46ms | total=15.8ms
+```
+
+**59.9–60.5fps，比带卡片的 v1.0 还略高**（卡片绘制本来就在 `cards=0` 路径之外，
+省下的主要是代码体积和指令 cache）。`flush` 仍在 3.0–3.4ms，`PWRITEROWS bad=`
+零条，7860 帧无衰减。画面见 `shots/v11_verify.png`。
+
+`compose` 的命令行签名没有变，`cards` 参数保留但被忽略 —— 车上装的 APK 已经
+把 `compose <port> <hold> <top> <bot> <cards> [x y w h]` 写死，改参数就得连 APK 一起换。
+
 ![仪表实际画面](shots/v10_60fps.png)
 
 中间是投屏内容，左右两侧的里程、胎压、车模全部完好，边缘没有黑洞或错位。
@@ -119,6 +137,16 @@ adb shell "echo '960,345,1440,426' > /data/local/tmp/vdcrop.txt"   # 车机侧�
 **别在仪表上调 `time.Now()` 做分项计时。** 内核 3.0.35 的时钟源偶发跳变，会出现「某个分项 36 秒、而整帧 16.4ms」这种自相矛盾的数字。判断性能只信 `total`（与 `frames/elapsed` 同量纲、互相自洽）。
 
 **LZ4 压缩器不要给匹配区间补登记。** 画面里大片渐变/纯色的匹配长度动辄几百字节，逐位置重新 hash 等于整帧算两遍。这一项就让发送线程从 62fps 掉到 47fps。
+
+**仪表端 `nc` 一次连接最多落 65536 字节。** 超过这个量的部分静默丢弃，`rc` 仍是 0。
+同一块 2.36MB 的二进制：整包 wget 停在 61440 B、`nc` 传 400KB 只落 397312、
+传 128KB 只落 65536 —— 都是这同一个 64KB socket 缓冲上限。往仪表送文件必须
+切块（本仓库用 `probe/pushmulti.py`，60000 字节/块），而且**每块都要校验落盘长度**，
+否则拼接出来的是错位文件，装上去只会 `Exec format error`。
+
+**`adb server` 会被周期性回收，脚本里的 adb 调用会静默失败。** 表现是
+`no devices/emulators found`，但被 `capture_output` 吞掉后只剩「一块都没传进去」。
+每次 adb 调用前都要检查并在失败时 `start-server` + `connect`，不能只在脚本开头连一次。
 
 ## 7. 环境
 
