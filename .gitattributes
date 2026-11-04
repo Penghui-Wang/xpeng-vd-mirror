@@ -1,0 +1,16 @@
+# 统一用 LF：脚本要在 Git Bash / 远端 Linux（仪表）上直接跑
+* text=auto eol=lf
+*.sh   text eol=lf
+*.py   text eol=lf
+*.go   text eol=lf
+*.java text eol=lf
+*.md   text eol=lf
+
+# 二进制，不做换行转换
+*.png binary
+*.jpg binary
+*.apk binary
+*.dex binary
+*.jar binary
+# 无扩展名的 ELF（仪表端接收程序，随 APK 一起分发）
+adbprobe/assets/icrecv_dbg binary

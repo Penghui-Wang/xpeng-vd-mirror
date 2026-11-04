@@ -1,0 +1,28 @@
+# 构建产物
+**/build/
+*.class
+*.apk
+*.apk.idsig
+*.keystore
+*.jks
+
+# dex：全局忽略，但 APK 的 assets 里那份是构建输入，必须入库
+*.dex
+!adbprobe/assets/vd.dex
+
+# 仪表端交叉编译产物（由 tools/icrecv2/build.sh 生成）
+# 注意：adbprobe/assets/icrecv_dbg 是 APK 的输入，路径不同，不受这条影响
+tools/icrecv2/icrecv_dbg
+tools/icrecv2/*.icf
+tools/icrecv2/*.bin
+
+# Python
+__pycache__/
+*.pyc
+probe/.frame*.bin
+probe/*.png
+
+# 系统
+Thumbs.db
+.DS_Store
+desktop.ini
