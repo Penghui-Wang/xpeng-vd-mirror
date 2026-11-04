@@ -36,6 +36,9 @@
 
 ## 2. 实测
 
+从 6fps 到 60fps 的完整过程、每一步的判断依据、以及走错的弯路，
+单独记在 **[docs/帧率优化记录.md](docs/帧率优化记录.md)**。
+
 ```
 车机  VDS| fps=62 cap=51682 proc=51682 sent=47554 bytes/s=7325523 procMs=5
 仪表  frames=2160 58.6fps (recv 550x384) read=1.27ms dec=8.13ms draw=4.57ms flush=3.25ms | total=17.2ms
