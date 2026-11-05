@@ -119,12 +119,9 @@ public final class VdSend {
         // 独立恢复入口：kill -9 之后残留的搬移状态用这条清理。
         // 必须幂等——主屏模式停止时窗口本来就在右栏，不能把用户正在用的界面拉到前台。
         if (restoreOnly) {
-            try {
-                android.os.Looper.prepareMainLooper();
-                Class<?> at = Class.forName("android.app.ActivityThread");
-                Object thread = at.getMethod("systemMain").invoke(null);
-                at.getMethod("getSystemContext").invoke(thread);
-            } catch (Throwable ignored) { }
+            // B5：这里原来要 systemMain() 初始化 ActivityThread。但整个 restore 只用
+            // `am` 命令行（exec）+ System.exit，一次 binder 都不发 —— 初始化白花 0.5~1s，去掉。
+
             int t = findRootTask(TARGET_PKG);
             if (t <= 0) {
                 say("restore: task not found");
@@ -140,7 +137,9 @@ public final class VdSend {
             say("restore: fixing display=" + cur + " bounds=" + b);
             if (cur != 0) {
                 moveTask(t, 0);
-                sleep(1500);
+                // B5：原来固定 sleep(1500)。moveTask 是同步 binder 调用，返回时已经搬完；
+                // 这里只做一次核实，没搬走再等 200ms 复查（最多 1 秒）。
+                for (int i = 0; i < 5 && taskDisplayOf(t) != 0; i++) sleep(200);
             }
             restoreRightPane();
             say("restore: done bounds=" + taskBounds(t));
@@ -426,7 +425,8 @@ public final class VdSend {
         if (cur > 0) {
             say("task on display " + cur + " -> move back to 0 and restore right pane");
             moveTask(task, 0);
-            sleep(1200);
+            // B5：同 restoreOnly 路径，把固定 sleep(1200) 换成一次核实
+            for (int i = 0; i < 5 && taskDisplayOf(task) != 0; i++) sleep(200);
             restoreRightPane();
         }
         if (!moveTask(task, vdDisplayId)) {
@@ -437,8 +437,10 @@ public final class VdSend {
         if (!boundsOk(taskBounds(task))) {
             say("bounds not right pane -> resize");
             resizeTask(task, 960, 0, 2400, 1080);
-            sleep(1500);
-            say("bounds after resize=" + taskBounds(task));
+            // B5：固定 sleep(1500) 改成轮询到落位（最多 1.5 秒）
+            String bb = taskBounds(task);
+            for (int i = 0; i < 5 && !boundsOk(bb); i++) { sleep(200); bb = taskBounds(task); }
+            say("bounds after resize=" + bb);
         }
 
         // DMS 不暴露虚拟屏的 token，只能自建一个 shadow display 共享它的 layerStack
@@ -470,19 +472,25 @@ public final class VdSend {
     static void restoreRightPane() {
         if (targetComponent == null) return;
         exec("am start -n " + targetComponent + " --windowingMode 5");
-        sleep(2000);
+        dropStackCache();
+        // B5：原来这里是 sleep(2000) 等窗口自己落位，再判断、再 resize。
+        // 但 resize 是幂等的，而且它才是真正把窗口摆到右栏的那一步 ——
+        // 直接 resize 再核对，比「先等 2 秒再决定要不要 resize」快 2 秒左右。
+        resizeTask(targetTaskId, 960, 0, 2400, 1080);
         String b = taskBounds(targetTaskId);
         say("right pane restored bounds=" + b);
         if (!boundsOk(b)) {
+            // 刚 start 完 task 可能还没进 freeform，resize 会被拒；补一次
+            sleep(400);
             resizeTask(targetTaskId, 960, 0, 2400, 1080);
-            sleep(1500);
-            say("bounds after resize=" + taskBounds(targetTaskId));
+            b = taskBounds(targetTaskId);
+            say("bounds after resize=" + b);
         }
     }
 
     /** 读 RootTask 的 bounds 字符串，如 [960,0][2400,1080] */
     static String taskBounds(int task) {
-        String out = exec("am stack list");
+        String out = stackList();
         String key = "RootTask id=" + task + " ";
         for (String ln : out.split("\n")) {
             String s = ln.trim();
@@ -509,13 +517,37 @@ public final class VdSend {
         }
     }
 
+    /**
+     * `am stack list` 的短缓存。
+     *
+     * B5：findRootTask / taskDisplayOf / taskBounds 以前各起一个 `am` 进程（每次约 0.4s），
+     * 一次恢复要 5~6 次。同一个瞬间的 dump 内容是一样的，缓存 800ms 就够，
+     * 搬移/改尺寸之后必须 dropStackCache()。
+     */
+    static String stackCache;
+    static long stackAtMs;
+
+    static String stackList() {
+        long now = System.currentTimeMillis();
+        if (stackCache != null && now - stackAtMs < 800) return stackCache;
+        stackCache = exec("am stack list");
+        stackAtMs = now;
+        return stackCache;
+    }
+
+    static void dropStackCache() {
+        stackCache = null;
+    }
+
     static void resizeTask(int task, int l, int t, int r, int b) {
         say("resize Task -> " + exec("am task resize " + task + " " + l + " " + t + " " + r + " " + b)
                 .trim());
+        dropStackCache();
     }
 
     /** 从 am stack list 里找包名所在的 RootTask，顺便记下组件名 */
-    static int findRootTask(String pkg) {        String out = exec("am stack list");
+    static int findRootTask(String pkg) {
+        String out = stackList();
         int curRoot = -1;
         for (String ln : out.split("\n")) {
             String s = ln.trim();
@@ -533,7 +565,7 @@ public final class VdSend {
     }
 
     static int taskDisplayOf(int task) {
-        String out = exec("am stack list");
+        String out = stackList();
         String key = "RootTask id=" + task + " ";
         for (String ln : out.split("\n")) {
             String s = ln.trim();
@@ -548,6 +580,7 @@ public final class VdSend {
     static boolean moveTask(int task, int display) {
         for (int i = 0; i < 4; i++) {
             String r = exec("am display move-stack " + task + " " + display);
+            dropStackCache();
             sleep(1500);
             int cur = taskDisplayOf(task);
             if (cur == display) return true;

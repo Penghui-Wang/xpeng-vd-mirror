@@ -3,6 +3,38 @@
 > 与 `docs/审计-四类改造-答复与需求确认-v1.md` 的批次一一对应。
 > 每条记录「改了什么 / 怎么验的 / 还有什么没做」，便于回滚与交接。
 
+## B5 第三批：停投屏 4.95s → 1.69s（2026-11-05 18:50）
+
+> 停止链路原来由几段固定等待拼成（`sleep 2` + `sleep 1500` + `sleep 2000`），加起来就是 4.3s。
+> 这批不碰协议，只把「等固定时间」换成「等到状态对为止」。
+
+### 改了什么
+
+| 文件 | 变更 |
+|---|---|
+| `tools/remote/killvds.sh` | TERM 后 `sleep 2` → 轮询到「真的没有 VdSend」；新增 `count_procs()`（只数 `/proc/<pid>/cmdline` 以 `app_process` 开头的，避免把 grep 自己数进去） |
+| `asx/.../VdSend.java` | ① `restoreRightPane()`：`am start` 后不再 `sleep 2000`，直接 `am task resize`（幂等）再核实，失败补一次；② 搬回主屏后 `sleep 1500/1200` → 核实 `displayId`，没搬走才复查；③ `am stack list` 三次 → 800ms 短缓存（搬移/resize 后失效）；④ restore 路径删掉 `systemMain()`（只用 `am` 命令行，不发 binder） |
+
+### 怎么验的
+
+| 项 | 结果 |
+|---|---|
+| 应用侧「收尾完成」 | **4955 ms → 1629 / 1693 ms** |
+| 其中 `killvds stop` | 4.35 s → **~0.42 s**（TERM 68ms + restore 211–216ms + 轮询 ~0.1s） |
+| `RESTORE_OK` / 残留 / 窗口 | 有 / 0 / `[960,0][2400,1080]`（直测 1 轮 + 压测 3 轮一致） |
+| 开始投屏 | 仍 3.0s（本批不涉及） |
+
+### 踩到的坑（自己挖的，已写进注释）
+
+第一版把 `sleep 2` 换成 `list | wc -l` 轮询，**永远看到 1 个进程**、20 轮跑满 2 秒 ——
+那条 `grep -F com.probe.asx.VdSend` 自己的命令行里就写着模式串，把自己数进去了。
+改成只数 `app_process` 实例后，轮询降到 ~0.1s。
+
+### 没做的
+
+- `killvds.sh` 里仍保留「上限 2s」的兜底：真遇到杀不掉的进程，行为等价于原来的 sleep 2（不会更慢）。
+- restore 里 `am start` 仍然是新起一个 `am` 进程（约 0.4s），没有换成 binder —— 换的话要重新引入 `systemMain()`，得不偿失。
+
 ## B5 根因修复：Adb 单连接并发会吞掉对方的 CLSE（2026-11-05 18:36）
 
 > 「stop 偶发卡 45s」查到底了：**不是 `killvds.sh stop`、也不是 `--restore` 慢**，

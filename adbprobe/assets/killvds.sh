@@ -19,6 +19,20 @@ list() {
   ps -A -o PID,ARGS 2>/dev/null | grep -F com.probe.asx.VdSend | awk '{print $1}'
 }
 
+# 只数「真的是 VdSend」的实例。
+# 注意：不能直接 `list | wc -l` —— 那条 grep 自己的命令行里就写着模式串，
+# 会把自己也数进去，轮询永远看到 1（B5 第一版就栽在这）。
+count_procs() {
+  local_n=0
+  for p in $(list); do
+    [ -z "$p" ] && continue
+    [ "$p" = "$$" ] && continue
+    c=$(cat /proc/$p/cmdline 2>/dev/null | tr '\0' ' ')
+    case "$c" in app_process*) local_n=$((local_n + 1));; esac
+  done
+  echo "$local_n"
+}
+
 if [ "$MODE" = "check" ]; then
   for p in $(list); do
     [ -z "$p" ] && continue
@@ -42,7 +56,19 @@ for p in $(list); do
 done
 
 # 等旧进程退出 + 虚拟屏销毁 + 系统把窗口迁回主屏
-[ "$nterm" -gt 0 ] && sleep 2
+#
+# B5：原来是固定 sleep 2。实测 SIGTERM 之后 VdSend 通常几百毫秒就退了，
+# 固定等 2 秒纯粹是白等（这段在「换应用 / 停投屏」里每次都要付）。
+# 改成轮询进程数：快的时候立刻过，慢的时候上限仍然是 2 秒。
+if [ "$nterm" -gt 0 ]; then
+  i=0
+  while [ $i -lt 20 ]; do
+    n=$(count_procs)
+    [ "$n" -eq 0 ] && break
+    sleep 0.1
+    i=$((i+1))
+  done
+fi
 
 # 关键：恢复不能靠被杀的进程跑 shutdown hook —— 实测 app_process 下的 ART 收到 SIGTERM
 # 直接终止，hook 一行都不会执行（vdsend.log 里没有 RESTORE 记录）。改成起一个独立进程
