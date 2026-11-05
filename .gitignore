@@ -5,6 +5,7 @@
 *.apk.idsig
 *.keystore
 *.jks
+adbprobe/test/out/
 
 # dex：全局忽略，但 APK 的 assets 里那份是构建输入，必须入库
 *.dex
@@ -21,6 +22,18 @@ __pycache__/
 *.pyc
 probe/.frame*.bin
 probe/*.png
+
+# 私钥：绝不入库。adbkey.der 是车机 adb 授权的唯一凭据，泄露或丢失都不可逆
+*.der
+*.pem
+*.p12
+
+# 现场材料：截图/日志/基线 APK/图标母版，体积大且非源码，本地留档不入库
+# 说明：图标已消费到 adbprobe/res/ 并入库，这里的 material 只是母版与证据原件
+docs/materials/
+
+# 工作区本地记忆（AI 会话状态，不属工程产物）
+.workbuddy/
 
 # 系统
 Thumbs.db
