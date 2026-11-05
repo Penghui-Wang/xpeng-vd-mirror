@@ -11,15 +11,16 @@
 #   - APK 以 assets 附件上传，正文取发行说明文件。
 set -euo pipefail
 
-REPO="${1:?用法: GITHUB_TOKEN=... bash tools/github-release.sh <owner/repo> <tag> <apk> [说明文件]}"
+REPO="${1:?用法: GITHUB_TOKEN=... bash tools/github-release.sh <owner/repo> <tag> <apk> [说明文件] [附件名]}"
 TAG="${2:?缺 tag，例如 v2.2.0}"
 APK="${3:?缺 APK 路径，例如 adbprobe/AdbProbe.apk}"
 NOTES="${4:-}"
+ASSET="${5:-$(basename "$APK")}"
 
 [ -n "${GITHUB_TOKEN:-}" ] || { echo "!! 需要 GITHUB_TOKEN 环境变量（repo 权限）"; exit 2; }
 [ -f "$APK" ] || { echo "!! 找不到 APK: $APK"; exit 2; }
 
-NAME="$(basename "$APK")"
+NAME="$ASSET"
 API="https://api.github.com/repos/${REPO}/releases"
 AUTH=(-H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json"
       -H "X-GitHub-Api-Version: 2022-11-28")
