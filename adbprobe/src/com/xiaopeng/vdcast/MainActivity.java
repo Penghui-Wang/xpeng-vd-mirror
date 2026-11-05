@@ -731,9 +731,21 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         c2.addView(r2);
         body.addView(c2);
 
-        // ---------- 卡片 3：主 CTA ----------
+        // ---------- 卡片 3：预演 → 主 CTA ----------
         // 整个面板只有这一个「必须点对」的按钮：全宽、加高、文案随状态变。
+        // UI-09 之后流程是「先预演、再启动」，所以预览入口放在主 CTA **上面** ——
+        // 按钮的上下顺序就是流程顺序，不靠用户自己记。
         LinearLayout c3 = card();
+
+        LinearLayout r5 = row();
+        btnPreview = mkButton("预览画面（预演：先看效果，没投屏也能看）");
+        LinearLayout.LayoutParams pvLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        pvLp.bottomMargin = dp(6);
+        btnPreview.setLayoutParams(pvLp);
+        r5.addView(btnPreview);
+        c3.addView(r5);
+
         LinearLayout r4 = row();
         btnStartVd = mkPrimary("启动投屏");
         LinearLayout.LayoutParams goLp = new LinearLayout.LayoutParams(
@@ -753,13 +765,6 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         cfgHint = text("", 20, C_MUTED);
         cfgHint.setPadding(0, dp(5), 0, 0);
         c3.addView(cfgHint);
-
-        LinearLayout r5 = row();
-        r5.setPadding(0, dp(4), 0, 0);
-        btnPreview = mkButton("预览画面");
-        r5.addView(btnPreview);
-        r5.addView(spacer());
-        c3.addView(r5);
         body.addView(c3);
 
         // ---------- 卡片 4：高级（默认折叠） ----------
