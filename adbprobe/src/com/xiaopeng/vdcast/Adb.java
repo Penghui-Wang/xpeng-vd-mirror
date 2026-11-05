@@ -156,7 +156,7 @@ public final class Adb {
      * 只把公钥写进白名单。所以点完允许必须重开一次 socket 重新握手，
      * 那时签名（AUTH TYPE=2）才能通过。实测单轮死等会一直挂到超时。
      */
-    public boolean connect(String host, int port, int approveSec) throws Exception {
+    public synchronized boolean connect(String host, int port, int approveSec) throws Exception {
         long deadline = System.currentTimeMillis() + approveSec * 1000L;
         for (int attempt = 1; attempt <= 3; attempt++) {
             long left = deadline - System.currentTimeMillis();
@@ -252,7 +252,7 @@ public final class Adb {
         return sock != null && sock.isConnected() && !sock.isClosed();
     }
 
-    public void close() {
+    public synchronized void close() {
         try { if (sock != null) sock.close(); } catch (Throwable ignored) { }
         sock = null;
         in = null;
@@ -261,8 +261,16 @@ public final class Adb {
 
     // ---------------- 执行 ----------------
 
-    /** 开一条 shell 流跑命令，返回 stdout+stderr 文本 */
-    public String exec(String cmd, int timeoutMs) throws IOException {
+    /**
+     * 开一条 shell 流跑命令，返回 stdout+stderr 文本。
+     *
+     * <p><b>必须串行</b>：这个客户端是单连接多流的最小实现，{@code readAll()} 会把不属于自己
+     * 那条流的包直接丢掉（包括对方的 CLSE）。两条命令并发时，先读完的那条会把另一条流的
+     * 收尾包吃掉 —— 后者就永远等不到结束，直到读超时。
+     * 2026-11-05 的「stop 偶发卡 45s」就是 3 秒补测线程和 stop 并发撞出来的（见 B5 根因记录）。
+     * 加了 synchronized 之后，同样的错误调用也只会排队，不会互相吞包。
+     */
+    public synchronized String exec(String cmd, int timeoutMs) throws IOException {
         return execRc(cmd, timeoutMs).text;
     }
 
@@ -270,7 +278,7 @@ public final class Adb {
      * 跑命令并取回退出码。
      * legacy shell 服务不回报退出码，所以在命令尾追加哨兵行 `__RC=$?` 再剥离。
      */
-    public Res execRc(String cmd, int timeoutMs) throws IOException {
+    public synchronized Res execRc(String cmd, int timeoutMs) throws IOException {
         if (sock == null || out == null) throw new IOException("未连接");
         String withRc = cmd + "\n__RC=$?; echo \"__RC=$__RC\"\n";
         Stream s = openStream("shell:" + withRc + "\0", Math.min(timeoutMs, 20000));
@@ -293,7 +301,7 @@ public final class Adb {
 
     // ---------------- 推文件（adb push 等价） ----------------
 
-    public void push(byte[] data, String remote, int mode, int timeoutMs) throws IOException {
+    public synchronized void push(byte[] data, String remote, int mode, int timeoutMs) throws IOException {
         if (sock == null || out == null) throw new IOException("未连接");
         Stream s = openStream("sync:\0", 15000);
 
@@ -355,7 +363,7 @@ public final class Adb {
      * 为什么不用 `shell:cat`：adbd 的 shell 服务会做 CR/LF 与特殊字节转义（伪终端），
      * 二进制走那条路必坏。sync 是裸字节流，这也是 adb pull 本身的做法。
      */
-    public byte[] pull(String remote, int timeoutMs) throws IOException {
+    public synchronized byte[] pull(String remote, int timeoutMs) throws IOException {
         if (sock == null || out == null) throw new IOException("未连接");
         Stream s = openStream("sync:\0", 15000);
         long deadline = System.currentTimeMillis() + timeoutMs;

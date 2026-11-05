@@ -1775,6 +1775,10 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
      * 代价是**那一刻两侧的 fps 还没打出来**（VdSend 每 2 秒打一行、icrecv 每 60 帧打一行）。
      * 所以 3 秒后补跑一次和「刷新」完全相同的探测，把三层小灯与 fps 补齐 ——
      * 只在后台线程补，不占启动时间。
+     *
+     * <p>**必须走 worker**：它和「停止」用的是同一个 Adb 连接。以前这里用裸线程直接 `a.exec`，
+     * 和 stop 撞在一起会互相吞掉对方的 CLSE，stop 就一直等到读超时（B5 根因，见
+     * `docs/B5-启动链分解-v1.md` §7）。Adb 现在也加了串行锁，两道保险。
      */
     private void nudgeCarFps() {
         final Adb a = adb;
