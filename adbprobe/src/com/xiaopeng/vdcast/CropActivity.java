@@ -27,6 +27,10 @@ public class CropActivity extends Activity {
     private TextView hint;
     private CheckBox lock;
     private float ratio;
+    /** 比例是从哪儿来的（「仪表区域 1216×360」/「发送尺寸 …」），直接写在锁比例框上，方便肉眼核对 */
+    private String ratioFrom = "";
+    /** UI-02：这张底图是从哪儿截的（虚拟屏 / 目标应用窗口 / 主屏），页面左上角必须标出来 */
+    private String src = "";
 
     @Override
     protected void onCreate(Bundle b) {
@@ -45,9 +49,20 @@ public class CropActivity extends Activity {
 
         Intent in = getIntent();
         String path = in.getStringExtra("png");
+        src = in.getStringExtra("src");
         int outW = in.getIntExtra("out_w", 1920);
         int outH = in.getIntExtra("out_h", 568);
-        ratio = outH > 0 ? outW / (float) outH : 0f;
+        // UI-13：锁比例**直接用界面上的仪表区域矩形算**，不依赖 cfg.outW/outH ——
+        // 那两个值以前只在 start() 里被覆盖，先定矩形、没启动就来框选，锁到的是上一次的比例，
+        // 框出来的画面会被拉伸或裁掉。把 crect 本身传进来，就不存在「同步没赶上」的窗口。
+        Rect cr = parse(in.getStringExtra("crect"));
+        if (cr != null) {
+            ratio = cr.width() / (float) cr.height();
+            ratioFrom = "仪表 " + cr.width() + "×" + cr.height();
+        } else {
+            ratio = outH > 0 ? outW / (float) outH : 0f;
+            ratioFrom = "发送 " + outW + "×" + outH;
+        }
 
         Bitmap bmp = decode(path);
         if (bmp == null) {
@@ -122,6 +137,26 @@ public class CropActivity extends Activity {
         root.addView(view, new android.widget.FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
+        // UI-02：底图来源角标（必须在 view 之后加，否则被底图盖住）。
+        // 取到主屏时要说清「你框的未必是真正投出去的那块」，否则用户以为在调投屏画面。
+        if (src != null && !src.isEmpty()) {
+            boolean mainScreen = src.startsWith("主屏");
+            TextView badge = new TextView(this);
+            badge.setText("底图来源：" + src
+                    + (mainScreen ? "（目标应用不在副屏；先启动投屏/预演再框选更准）" : ""));
+            badge.setTextColor(mainScreen ? 0xFFFFC46B : 0xFFBFE3FF);
+            badge.setTextSize(TypedValue.COMPLEX_UNIT_PX, 24);
+            badge.setBackground(pill(0xE61B1F24, mainScreen ? 0xFF6B4A16 : 0xFF24445E));
+            badge.setPadding(dp(12), dp(6), dp(12), dp(6));
+            android.widget.FrameLayout.LayoutParams blp =
+                    new android.widget.FrameLayout.LayoutParams(
+                            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            blp.gravity = Gravity.TOP | Gravity.LEFT;
+            blp.leftMargin = dp(12);
+            blp.topMargin = dp(12);
+            root.addView(badge, blp);
+        }
+
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setGravity(Gravity.CENTER_VERTICAL);
@@ -140,7 +175,9 @@ public class CropActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         lock = new CheckBox(this);
-        lock.setText("锁比例");
+        lock.setText(ratio > 0
+                ? String.format(java.util.Locale.US, "锁比例 %.2f · %s", ratio, ratioFrom)
+                : "锁比例");
         lock.setTextColor(0xFFE0E0E0);
         lock.setTextSize(TypedValue.COMPLEX_UNIT_PX, 24);
         lock.setChecked(true);

@@ -265,6 +265,15 @@ public final class VdCtl {
     private String activePkg = "";
 
     /**
+     * 目标应用是不是「本次由我们拉起」的（UX-13）。
+     *
+     * 只用于**记录与提示**，绝不用于关进程：用户可能正开着音乐 App 一边听一边投，
+     * 退出时把它杀掉是最典型的误伤（R2-1 的默认值就是「不代关」）。
+     * 这里留一个标记，stop 时如实说明「是我们拉起的，仍留着」或「本来就在跑，没动过」。
+     */
+    private boolean launchedByUs;
+
+    /**
      * 本次进程里仪表接收端「真的起来过」。restore 幂等的依据：
      *
      * 没起过接收端，仪表 fb1 根本没被碰过，这时候去等 RESTORE 标记是白等（一次 RPC 1.5~2s），
@@ -750,8 +759,7 @@ public final class VdCtl {
             boolean ok = carOk && restoreOk;
             if (ok) {
                 log.print("  收尾完成，用时 " + (System.currentTimeMillis() - t0) + " ms");
-            } else {
-                if (!carOk) {
+            } else {                if (!carOk) {
                     log.print("  !! 车机发送端未确认退出（残留 " + residualCar + " 个）");
                 }
                 if (!restoreOk) {
@@ -759,6 +767,12 @@ public final class VdCtl {
                     log.print("     处理：重开一次「停止」，或断电重启仪表；日志在仪表 /tmp/icrecv.log");
                 }
             }
+            // UX-13：退出只停自己的进程（VdSend / icrecv），**不代关目标应用** ——
+            // 用户可能正开着音乐 App 一边听一边投，退出时把它杀掉是最典型的误伤（R2-1）。
+            // 这里只如实说明是不是我们拉起的，方便事后核对「没误杀」。
+            String who = activePkg.isEmpty() ? cfg.pkg : activePkg;
+            log.print("  不代关目标应用：" + who
+                    + (launchedByUs ? "（本次由我们拉起，仍留着）" : "（本来就在运行，没动过）"));
             activePkg = "";
             // 恢复窗口会把目标应用搬回前台，面板整个被盖住 —— 用户点完「停止」看不到结果。
             // 收尾完成后把自己拉回来（此时 restore 已完成，不会再被抢）
@@ -1329,6 +1343,7 @@ public final class VdCtl {
         TaskInfo t = findTask(cfg.pkg);
         if (t != null) {
             log.print("  已在运行: " + t.label());
+            launchedByUs = false;
             return true;
         }
         log.print("  没有窗口，先拉起 " + cfg.pkg);
@@ -1339,6 +1354,7 @@ public final class VdCtl {
             Thread.sleep(1000);
             t = findTask(cfg.pkg);
             if (t != null) {
+                launchedByUs = true;   // 只有这条路径算「我们拉起的」；停的时候不关它
                 log.print("  拉起成功: " + t.label());
                 return true;
             }
@@ -1372,8 +1388,23 @@ public final class VdCtl {
      */
     public byte[] snapshot() throws IOException {
         int vd = vdDisplayId();
-        String arg = vd > 0 ? "-d " + vd + " " : "";
-        log.print("  截取" + (vd > 0 ? "虚拟屏 display " + vd : "主屏"));
+        // UI-02：底图来源必须能说清楚，页面上要标出来。
+        // 优先级 = 虚拟屏（正在投的那块）→ 目标应用窗口（被搬到副屏、但虚拟屏还没起）
+        //          → 主屏（兜底，此时框出来的未必是真正会投出去的画面）。
+        int target = targetDisplayId();
+        int disp = 0;
+        if (vd > 0) {
+            disp = vd;
+            shotSource = "虚拟屏 display " + vd;
+        } else if (target > 0) {
+            disp = target;
+            shotSource = "目标应用窗口 display " + target;
+        } else {
+            shotSource = "主屏";
+        }
+        shotDisplay = disp;
+        String arg = disp > 0 ? "-d " + disp + " " : "";
+        log.print("  截取" + shotSource);
 
         String r = adb.exec("screencap -p " + arg + SHOT
                 + "; stat -c %s " + SHOT + " 2>/dev/null", 30000).trim();
@@ -1387,6 +1418,20 @@ public final class VdCtl {
         adb.exec("rm -f " + SHOT, 8000);
         if (png.length < 1000) throw new IOException("截图过小 " + png.length + " B，可能屏幕全黑");
         return png;
+    }
+
+    /** 上一次 snapshot() 的底图来源（给 UI-02 的页面角标用） */
+    public String shotSource = "";
+    /** 上一次 snapshot() 用的 displayId（0 = 主屏） */
+    public int shotDisplay;
+
+    /** 目标应用所在的副屏；不在副屏 / 没窗口返回 -1 */
+    private int targetDisplayId() {
+        try {
+            TaskInfo t = findTask(cfg.pkg);
+            if (t != null && t.displayId > 0) return t.displayId;
+        } catch (Throwable ignored) { }
+        return -1;
     }
 
     // ============================================================ 资源

@@ -3,6 +3,7 @@ package com.xiaopeng.vdcast;
 import android.app.Activity;
 import android.content.Intent;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Rect;
@@ -56,6 +57,16 @@ public class PreviewActivity extends Activity {
 
     /** 裁切信息（用于顶栏文字 + 边框标注），由主面板带过来 */
     private String crop = "", crect = "";
+    /** UX-02 静态预演：没有实时流时用一张截图摆位（0 风险，必交付的那一种） */
+    private boolean staticMode;
+    private String pngPath = "";
+    /** 底图来源（主屏 / 虚拟屏 display N），静态预演时顶栏必须写出来（UI-02） */
+    private String srcLabel = "";
+
+    /** UI-03：合成底图 —— 仪表原始版面 1920×720（assets/fb0_pre.png），流贴在 crect 那块 */
+    private Bitmap bg;
+    private final Rect bgDst = new Rect();
+    private final Rect inner = new Rect();
 
     private final Object lock = new Object();
     private final Bitmap[] ring = new Bitmap[RING];
@@ -96,11 +107,71 @@ public class PreviewActivity extends Activity {
         port = in.getIntExtra("port", PORT_DEFAULT);
         crop = nz(in.getStringExtra("crop"));
         crect = nz(in.getStringExtra("crect"));
+        staticMode = "static".equals(in.getStringExtra("mode"));
+        pngPath = nz(in.getStringExtra("png"));
+        srcLabel = nz(in.getStringExtra("src"));
 
         borderPaint.setStyle(Paint.Style.STROKE);
         borderPaint.setColor(0xFF3D8BFD);
 
+        loadBackdrop();
         setContentView(buildUi());
+        if (staticMode) loadStaticFrame();
+    }
+
+    /**
+     * 合成底图：仪表原版面 1920×720。
+     *
+     * 用打包进来的静态图，**不去 dump 仪表 fb1** —— dump 走的是 icrecv 同一个进程，
+     * 会跟投屏主循环抢 CPU（R-01/C-3 的结论）。
+     */
+    private void loadBackdrop() {
+        try (InputStream is = getAssets().open("fb0_pre.png")) {
+            BitmapFactory.Options o = new BitmapFactory.Options();
+            o.inPreferredConfig = Bitmap.Config.RGB_565;
+            bg = BitmapFactory.decodeStream(is, null, o);
+        } catch (Throwable ignored) {
+            bg = null;   // 没底图就退化成只画流，不影响预览本身
+        }
+    }
+
+    /** UX-02：静态预演 —— 一张截图按 crop 裁好，后面和实时流走同一套摆位逻辑 */
+    private void loadStaticFrame() {
+        try {
+            BitmapFactory.Options o = new BitmapFactory.Options();
+            o.inPreferredConfig = Bitmap.Config.RGB_565;
+            Bitmap full = BitmapFactory.decodeFile(pngPath, o);
+            if (full == null) return;
+            Rect c = parseRect(crop);
+            Bitmap use = full;
+            if (c != null && c.right <= full.getWidth() && c.bottom <= full.getHeight()) {
+                use = Bitmap.createBitmap(full, c.left, c.top, c.width(), c.height());
+            }
+            synchronized (lock) {
+                ring[0] = use;
+                front = 0;
+                frameSeq = 1;
+                frameW = use.getWidth();
+                frameH = use.getHeight();
+            }
+        } catch (Throwable ignored) { }
+    }
+
+    /** "x,y,w,h" → Rect；解析不出来返回 null */
+    private static Rect parseRect(String s) {
+        if (s == null) return null;
+        String[] p = s.trim().split(",");
+        if (p.length != 4) return null;
+        try {
+            int x = Integer.parseInt(p[0].trim());
+            int y = Integer.parseInt(p[1].trim());
+            int w = Integer.parseInt(p[2].trim());
+            int h = Integer.parseInt(p[3].trim());
+            if (w <= 0 || h <= 0) return null;
+            return new Rect(x, y, x + w, y + h);
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     private static String nz(String s) { return s == null ? "" : s.trim(); }
@@ -160,6 +231,8 @@ public class PreviewActivity extends Activity {
             stopThreads();
             startThreads();
         });
+        // 静态预演没有流可重连，按钮藏起来；「启动投屏」在两种模式下都有
+        reconnect.setVisibility(staticMode ? android.view.View.GONE : android.view.View.VISIBLE);
         // 主面板是 singleTask，把「启动 vd」这条遥控指令交给它自己走完整流程。
         // UX-11 后动作统一为 act=start + mode，这里也跟着改（旧的 act=vd 已删除）。
         startCast.setOnClickListener(v -> {
@@ -173,17 +246,26 @@ public class PreviewActivity extends Activity {
         return root;
     }
 
-    /** 顶部一行：源裁切 → 仪表矩形，加实时帧率 */
+    /** 顶部一行：静态预演的底图来源 / 实时流的源裁切 → 仪表矩形，加帧率 */
     private String glyphLine() {
         StringBuilder sb = new StringBuilder();
-        if (!crop.isEmpty()) sb.append("车机裁切 ").append(crop);
+        if (staticMode) {
+            sb.append("静态预演（还没投屏）");
+            if (!srcLabel.isEmpty()) sb.append(" · 底图 ").append(srcLabel);
+        } else {
+            if (!crop.isEmpty()) sb.append("车机裁切 ").append(crop);
+        }
         if (!crect.isEmpty()) {
             if (sb.length() > 0) sb.append("   →   ");
             sb.append("仪表 ").append(crect);
         }
         if (sb.length() > 0) sb.append("     ");
-        sb.append(front < 0 ? "等待画面…" : (frameW + "×" + frameH
-                + "  " + arriveFps + " fps"));
+        if (front < 0) {
+            sb.append(staticMode ? "没有拍到画面" : "等待画面…");
+        } else {
+            sb.append(frameW).append("×").append(frameH);
+            if (!staticMode) sb.append("  ").append(arriveFps).append(" fps");
+        }
         return sb.toString();
     }
 
@@ -234,11 +316,14 @@ public class PreviewActivity extends Activity {
         if (running) return;
         running = true;
         needClear = true;
-        netThread = new Thread(new Runnable() {
-            public void run() { loop(); }
-        }, "vds-preview-net");
-        netThread.setDaemon(true);
-        netThread.start();
+        // 静态预演只有一张图，没有网络线程：不连 5570，也就不会误报「未连上发送端」
+        if (!staticMode) {
+            netThread = new Thread(new Runnable() {
+                public void run() { loop(); }
+            }, "vds-preview-net");
+            netThread.setDaemon(true);
+            netThread.start();
+        }
 
         drawThread = new Thread(new Runnable() {
             public void run() { drawLoop(); }
@@ -254,8 +339,10 @@ public class PreviewActivity extends Activity {
         drawThread = null;
         if (a != null) a.interrupt();
         if (b != null) b.interrupt();
-        synchronized (lock) {
-            front = -1;
+        if (!staticMode) {
+            synchronized (lock) {
+                front = -1;
+            }
         }
     }
 
@@ -382,13 +469,16 @@ public class PreviewActivity extends Activity {
             int availW = cw - dp(16);
             if (availH <= 0 || availW <= 0) { sleep(10); continue; }
 
-            float sc = Math.min(availW / (float) bmp.getWidth(),
-                    availH / (float) bmp.getHeight());
-            int dw = Math.round(bmp.getWidth() * sc);
-            int dh = Math.round(bmp.getHeight() * sc);
+            // UI-03：按仪表原版面 1920×720 的比例摆，流贴到 crect 那块 ——
+            // 只看「投屏区一块黑底」看不出压没压到状态栏/告警带，合成底图才看得出来。
+            float sc = Math.min(availW / (float) VdCtl.CL_W,
+                    availH / (float) VdCtl.CL_H);
+            int dw = Math.round(VdCtl.CL_W * sc);
+            int dh = Math.round(VdCtl.CL_H * sc);
             int left = (cw - dw) / 2;
             int top = availTop + (availH - dh) / 2;
-            dst.set(left, top, left + dw, top + dh);
+            bgDst.set(left, top, left + dw, top + dh);
+            mapCrect(bgDst, inner);
 
             if (needClear) clearAll(holder);
 
@@ -396,14 +486,15 @@ public class PreviewActivity extends Activity {
             try {
                 // 只锁画面那一块：整屏 lockCanvas + drawColor 每帧要抹 6MB，
                 // 30fps 就是 180MB/s，白白吃掉一两个毫秒
-                dirty.set(dst);
+                dirty.set(bgDst);
                 dirty.inset(-dp(3), -dp(3));
                 dirty.intersect(0, 0, cw, ch);
                 c = holder.lockCanvas(dirty);
                 if (c == null) continue;
                 c.drawColor(0xFF05070A);
-                c.drawBitmap(bmp, null, dst, bmpPaint);
-                drawEdge(c, dst);
+                if (bg != null) c.drawBitmap(bg, null, bgDst, bmpPaint);
+                c.drawBitmap(bmp, null, inner, bmpPaint);
+                drawEdge(c, inner);
             } catch (Throwable ignored) {
                 needClear = true;
             } finally {
@@ -423,6 +514,21 @@ public class PreviewActivity extends Activity {
             }
             sleep(2);
         }
+    }
+
+    /** 把 crect（1920×720 仪表坐标）映射到画布上的底图矩形里 */
+    private void mapCrect(Rect out, Rect into) {
+        Rect r = parseRect(crect);
+        if (r == null) {
+            into.set(out.left, out.top, out.right, out.bottom);
+            return;
+        }
+        float sx = out.width() / (float) VdCtl.CL_W;
+        float sy = out.height() / (float) VdCtl.CL_H;
+        into.set(out.left + Math.round(r.left * sx),
+                out.top + Math.round(r.top * sy),
+                out.left + Math.round(r.right * sx),
+                out.top + Math.round(r.bottom * sy));
     }
 
     /** 画面边缘：一圈细线 + 四个角加粗，一眼看出裁到哪儿 */

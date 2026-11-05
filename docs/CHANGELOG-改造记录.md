@@ -3,6 +3,79 @@
 > 与 `docs/审计-四类改造-答复与需求确认-v1.md` 的批次一一对应。
 > 每条记录「改了什么 / 怎么验的 / 还有什么没做」，便于回滚与交接。
 
+## B2 收尾：UI-09 流程条「预演 → 启动投屏」（2026-11-05 17:45）
+
+> B2 的最后一条。B4 把静态预演做出来之后，「预演在启动之前」才真正成立 —— 这一批只是把流程条兑现。
+
+### 改了什么
+
+| 文件 | 变更 |
+|---|---|
+| `MainActivity.java` | ① `STEP_NAMES` 改成 `连接 → 选应用 → 仪表区域 → 裁切画面 → 预演 → 启动投屏`；② `stepDone[4] = rehearsed \|\| previewOpened`、`stepDone[5] = fresh`；③ **新增 `rehearsed` 标记**（与 `previewOpened` 分开）：静态预演/实时预览看过即置位，**启动后不清**，配置一改由 `cfgWatcher` 置回 false；④ `[0/8]` 前打印的流程行同步 |
+
+`rehearsed` 必须独立的原因：`previewOpened` 在 `startWith()` 里被清掉（实时预览要重开），
+直接拿它给「预演」打勾，会出现「启动完成反而把预演打回未完成」。
+
+### 怎么验的
+
+| 场景 | 结果 |
+|---|---|
+| 未投屏 → 静态预演 → 返回面板 | 流程条 `✓连接 ✓选应用 ✓仪表区域 ✓裁切画面 ✓预演 ｜ 6 启动投屏`（`materials/b4/UI09_flow_after_rehearsal.png`） |
+| 启动投屏后 | `✓预演 ✓启动投屏` 同时成立（`UI09_flow_after_start.png`）；`DST 352,180 1216x360`、`RESTORE_OK`、`收尾完成 4975 ms` |
+| 配置改动 | `cfgWatcher` 立即把「预演」打回未完成（代码级一致，未单独截图） |
+
+### 没做的 / 观察到的问题
+
+1. **启动成功后面板可能被别的应用盖住**：这次虚拟屏把 bilibili 移走时，下层的音乐 App 顶了上来，要手动点一下面板才回前台。B3 只在「停止后」拉回前台；要不要在 `start()` 成功后也拉回一次，归下一轮/B5 定（不影响投屏本身）。
+2. 实时预演（`asx --no-send`）仍按答复件 §2.2 留 B5 评估。
+
+## B4 选应用 / 裁切 / 预览（2026-11-05 17:35）
+
+> 六条一起交：选应用页、底图来源、合成预览、crect 锁比例、静态预演、不代关目标应用。
+> 全部在驻车条件下上车验过，证据在 `docs/materials/b4/`。
+
+### 改了什么
+
+| 文件 | 变更 |
+|---|---|
+| `AppGridActivity.java` | **新增**。5 列图标网格 + 应用名 + 运行中角标 + 搜索。数据源 `queryIntentActivities(MAIN/LAUNCHER)`；图标 **3 线程后台解码 + 8MB `LruCache`**（R-05：主线程不取图）；运行中角标由主面板预算后通过 Intent 传进来；搜索同时匹配名称与包名；`label` 等于包名或包名样式（`com.xiaopeng.xxx.App`）的系统内部 activity **过滤掉** |
+| `MainActivity.java` | ① `pickApp()` 从 `AlertDialog` 改成起 `AppGridActivity`，`onActivityResult(REQ_PICK)` 回填 pkg（不再直接改 `ctl.cfg().pkg`，维持 UX-17 的快照语义）；② `frameCrop()` 把 `crect` 和由它算出的 `out_w/out_h` 一起传给裁切页（UI-13），并把底图来源 `src` 带过去（UI-02）；③ `openPreview()` 改成两段式：投屏中走实时流，没投屏走静态预演（截一张 → 缓存 → `mode=static`），失败给「先启动投屏再预览」的出口 |
+| `PreviewActivity.java` | ① 底图：读 `assets/fb0_pre.png`（1920×720），按窗口等比缩放后作为仪表原版面；② 流画进 `crect` 映射出的矩形并加蓝框；③ 新增 `mode=static`：从 `png` 读一张、按 `crop` 裁好当唯一一帧，不启网络线程、不连 5570；④ 顶栏静态模式写「静态预演（还没投屏）· 底图 <来源>」，不收帧率；⑤ 静态模式隐藏「重连」 |
+| `CropActivity.java` | ① `ratio` 改成用 `crect` 直接算（UI-13），锁比例框显示「锁比例 1.00 · 仪表 540×540」；② 左上角新增底图来源角标（UI-02），主屏底图用琥珀色并提示「先启动投屏/预演再框选更准」 |
+| `VdCtl.java` | ① `snapshot()` 按「虚拟屏 → 目标应用副屏 → 主屏」选 display，并记 `shotSource` / `shotDisplay`（UI-02）；② `ensureTargetApp()` 记 `launchedByUs`（UX-13）；③ `stop()` 增加「不代关目标应用：…（本次由我们拉起，仍留着 / 本来就在运行，没动过）」一行 |
+| `AndroidManifest.xml` | 注册 `.AppGridActivity`；`versionCode 2 → 3`、`versionName 2.1 → 2.2`（R-06：新增 Activity 必须 +1） |
+
+### 怎么验的
+
+| 项 | 手段 | 结果 |
+|---|---|---|
+| UI-01 网格 | `act=pick` | 5 列图标网格 + 名称 + 运行中角标 + 搜索框（`materials/b4/UI01_app_grid.png`） |
+| UI-01 搜索 | `input tap` 聚焦 → `input text bili` | 只剩「哔哩哔哩」，点选后回面板 `目标应用 -> com.bilibili.bilithings`（`UI01_search.png`、`UI01_selected.png`） |
+| UI-02 来源 | 投屏中 `act=snap` | 角标「底图来源：虚拟屏 display 100」，底图就是真正投出去的那块（`UI02_source_vd.png`） |
+| UI-02 兜底 | 未投屏 `act=snap` | 角标「底图来源：主屏（目标应用不在副屏；先启动投屏/预演再框选更准）」（`UI13_lock_ratio.png`） |
+| UI-13 锁比例 | 先 `crect 540,100,540,540`，**未启动**就 `act=snap` | 锁比例框显示「锁比例 1.00 · 仪表 540×540」，框就是正方形（旧版会锁 3.38） |
+| UI-03 合成预览 | 投屏中点 `act=preview` | 仪表原版面（READY/PRND/2.5 bar/98947 km/24°C）+ 投屏区里是 QQ 音乐画面，蓝框标边界（`UI03_live_composite.png`） |
+| UX-02 静态预演 | 未投屏点 `act=preview` | 顶栏「静态预演（还没投屏）· 底图 主屏 → 仪表 352,180,1216,360」「1440×426」，合成图同屏可见（`UX02_static_rehearsal.png`） |
+| UX-13 不代关 | 目标应用先 `pidof` 为空 → `start` → `stop` | 日志「拉起成功」→「不代关目标应用：com.bilibili.bilithings（本次由我们拉起，仍留着）」，stop 后 `pidof` = 31882，两端进程 0 |
+| 装机 | `tools/installapk.sh`（图形安装器） | 17:33:51 覆盖安装；`versionCode=3 / versionName=2.2`；`base.apk` md5 `c4904acc6c9c195be8ea661139187bc6` 与本地一致 |
+| 回归 | `start` / `stop` 各一轮 | `DST 352,180 1216x360`、`RESTORE_OK`、`收尾完成 5029 ms`、自检干净 |
+
+### 没做的 / 已知残点
+
+1. **UI-09「预演前置」没挪**：静态预演已经可用，但把「预览」挪到「启动投屏」之前要动 8 步流程的编号与流程条，留给下一轮（B4 六条里不含它）。
+2. **实时预演没做**：`asx --no-send` 的准入条件（预演时帧率不回退）按答复件 §2.2 留 B5 评估；本轮的静态预演是「必交付」的那一半。
+3. **第一版网格返工过一次**：最初没滤掉「label 就是包名」的系统内部 activity，列表里全是 `com.xiaopeng.*`，现场加了过滤（label == 包名，或包名样式：只有字母数字下划线点且带点）。
+4. `act=clean` 无残留时仍打「残留已清理」——UX-11 记下的文案问题，本轮仍未改。
+
+### 回滚
+
+```bash
+git revert <本批 commit>
+```
+
+只动 APK 侧 Java、manifest 与文档，不涉及 `asx/`、`tools/icrecv2/`、投屏协议与仪表端命令行。
+想只回「选应用页」：把 `MainActivity.pickApp()` 换回旧的 `AlertDialog` 版本即可，`AppGridActivity` 留着不用不影响。
+
 ## B2 收口：UX-11 遥控入口语义统一 + PC 脚本同源（2026-11-05 17:25）
 
 > B2 的最后一条。审计答复 §2.3 的要求：**同一套动作在 APK 与 PC 脚本上都存在且命名一致**，

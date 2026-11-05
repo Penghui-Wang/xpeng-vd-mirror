@@ -41,6 +41,7 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
     private static final int PORT_DEFAULT = 5050;
     private static final int REQ_CROP = 1001;
     private static final int REQ_CLUSTER = 1002;
+    private static final int REQ_PICK = 1003;
     /**
      * 仪表默认投屏区 = 安全区 1216×360（43.8 万像素），不再是满宽横带。
      *
@@ -103,8 +104,8 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         // 由 refreshUi 按界面上的实际内容推导（见 refreshUiNow）
         refreshUi();
 
-        print("仪表投屏 v2.1");
-        print("流程：选应用 → 仪表区域 → 裁切画面 → 启动投屏 → 预览");
+        print("仪表投屏 v2.2");
+        print("流程：选应用 → 仪表区域 → 裁切画面 → 预演 → 启动投屏");
         setBusy(false);
         showGuideIfNeeded();
         handleIntent(getIntent());
@@ -408,8 +409,9 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
     // ---------- 顶部流程条 ----------
     // 顺序按「先定仪表投屏区、再按它的宽高比框车机画面」排：投屏区决定投出去多大，
     // 裁切框选要按这个比例锁框，反过来做等于先裁一次再重裁（UX-02）。
+    // UI-09：预演挪到启动之前 —— 静态预演已经能「没投屏先看效果」，所以流程终点是「启动投屏」。
     private static final String[] STEP_NAMES =
-            {"连接", "选应用", "仪表区域", "裁切画面", "启动投屏", "预览"};
+            {"连接", "选应用", "仪表区域", "裁切画面", "预演", "启动投屏"};
     private final TextView[] stepViews = new TextView[STEP_NAMES.length];
     private final boolean[] stepDone = new boolean[STEP_NAMES.length];
 
@@ -431,6 +433,15 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
     private String lastMode = "vd";
     /** 本次「投屏中」期间打开过预览页 */
     private boolean previewOpened;
+
+    /**
+     * 本次配置下预演过（静态预演或实时预览都算）。
+     *
+     * <p>UI-09 把「预演」排到「启动投屏」前面，所以这个标记必须在启动之后**依然成立** ——
+     * 和 {@link #previewOpened}（实时预览，投屏中才看得到，重开要重新连）不是一回事。
+     * 配置一改就作废：预演的是旧配置，不能拿它给新配置打勾。
+     */
+    private boolean rehearsed;
 
     private void setPhase(Phase p) { setPhase(p, ""); }
 
@@ -467,8 +478,9 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         stepDone[1] = hasPkg;
         stepDone[2] = hasCrect;
         stepDone[3] = hasCrop;
-        stepDone[4] = fresh;
-        stepDone[5] = fresh && previewOpened;
+        // UI-09：预演在启动之前。看过一次（静态预演或实时预览）就算过，配置改了会被 cfgWatcher 清掉
+        stepDone[4] = rehearsed || previewOpened;
+        stepDone[5] = fresh;
         int cur = 0;
         while (cur < stepDone.length && stepDone[cur]) cur++;
         paintSteps(cur);
@@ -869,7 +881,11 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
             public void onTextChanged(CharSequence s, int st, int b, int c) { }
 
             @Override
-            public void afterTextChanged(android.text.Editable s) { refreshUi(); }
+            public void afterTextChanged(android.text.Editable s) {
+                // 配置一改，之前的预演就不是这份配置的了，流程条上的「预演」必须作废
+                rehearsed = false;
+                refreshUi();
+            }
         };
         pkgEdit.addTextChangedListener(cfgWatcher);
         cropEdit.addTextChangedListener(cfgWatcher);
@@ -1464,66 +1480,27 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
 
     // ------------------------------------------------------------ 选应用 / 框选
 
-    /** 列出「正在跑的 + 已装的第三方应用」，点一个就设成目标 */
+    /** 打开独立选择页（UI-01：5 列图标网格 + 名称 + 运行中角标 + 搜索） */
     private void pickApp() {
         if (!ensureCtl()) return;
-        java.util.List<String> apps;
+        // 运行中角标的数据还在 adb 这边：逐个 findTask 一次。
+        // 成本和旧对话框一样（PERF-09 基线 656ms），只是把渲染搬到了独立页面。
+        java.util.ArrayList<String> running = new java.util.ArrayList<>();
         try {
-            apps = ctl.candidateApps();
+            for (String p : ctl.candidateApps()) {
+                try {
+                    if (ctl.findTask(p) != null) running.add(p);
+                } catch (Throwable ignored) { }
+            }
         } catch (Throwable t) {
-            print("!! 取应用列表失败: " + t.getMessage());
-            return;
+            print("!! 取运行中列表失败（不影响选择）：" + t.getMessage());
         }
-        if (apps.isEmpty()) {
-            print("!! 没取到应用列表（pm/am 不可用？）");
-            return;
-        }
-        print("可投应用 " + apps.size() + " 个，选一个");
-
-        final String[] items = new String[apps.size()];
-        for (int i = 0; i < items.length; i++) {
-            String p = apps.get(i);
-            boolean running = false;
-            try {
-                running = ctl.findTask(p) != null;
-            } catch (Throwable ignored) { }
-            items[i] = (running ? "● " : "○ ") + appLabel(p);
-        }
-
-        // 默认列表项字号在 density≈0.9 的车机上小得看不清也点不准，自己控制字号和行高
-        android.widget.ArrayAdapter<String> ad = new android.widget.ArrayAdapter<String>(
-                this, android.R.layout.simple_list_item_1, items) {
-            @Override
-            public android.view.View getView(int pos, android.view.View cv, ViewGroup parent) {
-                TextView tv = (TextView) super.getView(pos, cv, parent);
-                setPx(tv, 30);
-                tv.setTextColor(Color.rgb(20, 20, 20));
-                tv.setPadding(dp(6), dp(10), dp(6), dp(10));
-                return tv;
-            }
-        };
-
+        final String sel = pkgEdit.getText().toString().trim();
         runOnUiThread(() -> {
-            AlertDialog dlg = new AlertDialog.Builder(this)
-                    .setTitle("选择要投的应用（● 正在运行）")
-                    .setAdapter(ad, (d, which) -> {
-                        String pkg = apps.get(which);
-                        pkgEdit.setText(pkg);
-                        // 不在这里改 ctl.cfg().pkg：cfg 里的 pkg 属于「本次投出去的配置」，
-                        // 由 startWith 在启动时快照一次。投屏中换应用后立刻改它，
-                        // 停止时就会去恢复新应用的窗口，真正在虚拟屏上的旧窗口没人管。
-                        savePrefs();
-                        print("目标应用 -> " + pkg);
-                        // 投屏中换应用：refreshUi 会发现「界面配置 ≠ 已投出的快照」，
-                        // 把「启动投屏」重新变灰，提示需要再启动一次（UI-07）
-                        refreshUi();
-                    })
-                    .setNegativeButton("取消", null)
-                    .show();
-            // 默认对话框在横屏上只有一块窄条，包名+应用名要折两行；撑宽点一眼能看完
-            if (dlg.getWindow() != null) {
-                dlg.getWindow().setLayout(dp(560), ViewGroup.LayoutParams.WRAP_CONTENT);
-            }
+            Intent i = new Intent(this, AppGridActivity.class);
+            i.putStringArrayListExtra(AppGridActivity.EXTRA_RUNNING, running);
+            i.putExtra(AppGridActivity.EXTRA_SEL, sel);
+            startActivityForResult(i, REQ_PICK);
         });
     }
 
@@ -1547,13 +1524,23 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
             }
             print("  已取到 " + png.length / 1024 + " KB，进拖框界面");
 
+            final String src = ctl.shotSource;   // UI-02：底图来源带进页面并标出来
+
             final String crop = cropEdit.getText().toString().trim();
+            // UI-13：锁比例要按「仪表区域」这一行算，而不是 cfg.outW/outH。
+            // 矩形解析失败才退回 cfg（applyClusterCfg 刚刚同步过，兜底是安全区）。
+            int[] cr = rect(clusterEdit.getText().toString().trim());
+            final int ow = cr != null ? cr[2] : ctl.cfg().outW;
+            final int oh = cr != null ? cr[3] : ctl.cfg().outH;
+            final String crectTxt = clusterEdit.getText().toString().trim();
             runOnUiThread(() -> {
                 Intent i = new Intent(this, CropActivity.class);
                 i.putExtra("png", f.getAbsolutePath());
                 i.putExtra("crop", crop);
-                i.putExtra("out_w", ctl.cfg().outW);
-                i.putExtra("out_h", ctl.cfg().outH);
+                i.putExtra("crect", crectTxt);
+                i.putExtra("out_w", ow);
+                i.putExtra("out_h", oh);
+                i.putExtra("src", src);
                 startActivityForResult(i, REQ_CROP);
             });
         } catch (Throwable t) {
@@ -1565,6 +1552,24 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
     @Override
     protected void onActivityResult(int req, int res, Intent data) {
         super.onActivityResult(req, res, data);
+        if (req == REQ_PICK) {
+            if (res != RESULT_OK || data == null) {
+                print("选应用已取消");
+                return;
+            }
+            String pkg = data.getStringExtra("pkg");
+            if (pkg == null || pkg.isEmpty()) return;
+            pkgEdit.setText(pkg);
+            // 不在这里改 ctl.cfg().pkg：cfg 里的 pkg 属于「本次投出去的配置」，
+            // 由 startWith 在启动时快照一次。投屏中换应用后立刻改它，
+            // 停止时就会去恢复新应用的窗口，真正在虚拟屏上的旧窗口没人管（UX-17）。
+            savePrefs();
+            print("目标应用 -> " + pkg);
+            // 投屏中换应用：refreshUi 会发现「界面配置 ≠ 已投出的快照」，
+            // 把「启动投屏」重新变灰，提示需要再启动一次（UI-07）
+            refreshUi();
+            return;
+        }
         if (req == REQ_CLUSTER) {
             if (res != RESULT_OK || data == null) {
                 print("仪表区域选择已取消");
@@ -1602,27 +1607,58 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
     }
 
     /**
-     * 实时预览：全屏看 VD 里那块画面（数据来自发送端的本地预览端口）。
+     * 预览 / 预演（两段式，UX-02）。
      *
-     * 只能在投屏中开：画面是发送端在 5570 上现推的，没启动就没有流。
-     * 以前这里无条件把「预览」流程项标成完成，等于骗用户（UI-10）。
-     * 「启动前先看合成效果」要走静态预演，那是 B4 的事。
+     * 投屏中 → 实时预览：全屏看 VD 里那块画面（数据来自发送端的本地预览端口 5570）。
+     * 没投屏 → 静态预演：截一张当前画面、按 crop 裁好、贴到仪表底图的 crect 上。
+     *          零风险（不碰发送端、不占仪表），这是「先看效果再决定投不投」的那条路。
+     *
+     * 两种模式共用 {@link PreviewActivity} 的摆位逻辑，切换只换数据源。
+     * 以前没投屏时这里只打一句「先启动再看」，等于把「先看效果」堵死了。
      */
     private void openPreview() {
-        if (phase != Phase.CASTING && phase != Phase.STARTING) {
-            print("还没启动投屏：预览画面来自发送端的实时流（端口 "
-                    + (ctl != null ? ctl.cfg().previewPort : 5570) + "），先启动再看");
+        final String cropTxt = cropEdit.getText().toString().trim();
+        final String crectTxt = clusterEdit.getText().toString().trim();
+        if (phase == Phase.CASTING || phase == Phase.STARTING) {
+            int port = ctl != null ? ctl.cfg().previewPort : 5570;
+            Intent i = new Intent(this, PreviewActivity.class);
+            i.putExtra("port", port);
+            // 把当前裁切参数带过去，预览页顶栏/边框就能标出「这块是从哪儿裁出来的」
+            i.putExtra("crop", cropTxt);
+            i.putExtra("crect", crectTxt);
+            startActivity(i);
+            previewOpened = true;
+            rehearsed = true;
+            refreshUi();
             return;
         }
-        int port = ctl != null ? ctl.cfg().previewPort : 5570;
-        Intent i = new Intent(this, PreviewActivity.class);
-        i.putExtra("port", port);
-        // 把当前裁切参数带过去，预览页顶栏/边框就能标出「这块是从哪儿裁出来的」
-        i.putExtra("crop", cropEdit.getText().toString().trim());
-        i.putExtra("crect", clusterEdit.getText().toString().trim());
-        startActivity(i);
-        previewOpened = true;
-        refreshUi();
+        // 静态预演：取一张当前画面（有虚拟屏就截虚拟屏），页面上会写明底图来源（UI-02）
+        print("静态预演：取当前画面当底图…");
+        run(() -> {
+            if (!ensureCtl()) return;
+            try {
+                byte[] png = ctl.snapshot();
+                File f = new File(getCacheDir(), "preview_static.png");
+                try (FileOutputStream fo = new FileOutputStream(f)) { fo.write(png); }
+                final String src = ctl.shotSource;
+                runOnUiThread(() -> {
+                    Intent i = new Intent(this, PreviewActivity.class);
+                    i.putExtra("mode", "static");
+                    i.putExtra("png", f.getAbsolutePath());
+                    i.putExtra("crop", cropTxt);
+                    i.putExtra("crect", crectTxt);
+                    i.putExtra("src", src);
+                    startActivity(i);
+                    previewOpened = true;
+                    rehearsed = true;
+                    refreshUi();
+                });
+                print("静态预演：底图 " + src + " · 仪表 " + crectTxt + "（没有起投屏，零风险）");
+            } catch (Throwable t) {
+                print("!! 静态预演取图失败：" + t.getMessage());
+                print("   可以直接点「启动投屏」后再预览（实时流来自发送端）");
+            }
+        });
     }
 
     /** 打开仪表区域选择页（底图是打包进来的 fb0_pre.png，原生 1920x720） */    private void pickClusterArea() {
