@@ -87,6 +87,10 @@ public class PreviewActivity extends Activity {
     private final Paint bmpPaint = new Paint();
     private final Paint borderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
+    /** PERF-08：预览首帧埋点用（从 onCreate 起算，到第一帧上屏） */
+    private final long createdAt = SystemClock.uptimeMillis();
+    private boolean firstFrameLogged;
+
     private Thread netThread, drawThread;
     private byte[] padBuf;
     private volatile boolean needClear = true;
@@ -505,6 +509,13 @@ public class PreviewActivity extends Activity {
 
             // 没有新帧就不重绘：空转重绘除了烧 CPU 没有任何意义
             lastSeq = seq;
+            // PERF-08：预览首帧埋点（从 onCreate 到第一帧真正上屏）
+            if (!firstFrameLogged) {
+                firstFrameLogged = true;
+                long ms = SystemClock.uptimeMillis() - createdAt;
+                android.util.Log.i("ADBPROBE", "[preview] 首帧 " + ms + "ms ("
+                        + (staticMode ? "static" : "live") + ")");
+            }
             // 顶栏文字：状态 / 帧率变了才 setText，别每帧都触发一次布局
             String txt = hint != null ? hint : glyphLine();
             if (!txt.equals(lastText)) {

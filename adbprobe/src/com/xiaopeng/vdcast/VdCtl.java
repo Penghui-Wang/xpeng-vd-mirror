@@ -355,6 +355,10 @@ public final class VdCtl {
             // 上一次按过「中断」不能影响这一次；进度也要归零重算
             cancelled = false;
             progressDone();
+            // 换应用重启时，要恢复的是**上一次真正投出去的那个**应用，不是这次要投的。
+            // 以前这里直接用 cfg.pkg：A→B 切换时，killvds 会去恢复 B 的窗口，A 的窗口没人管，
+            // 留在已销毁的虚拟屏上（PERF-05 说的「会伤车」就是这个）。见 UX-17 的同类修复。
+            String prevPkg = activePkg;
             // 投出去的就是这一刻的 pkg，之前/之后界面上再改都与本次投屏无关
             activePkg = cfg.pkg;
             // 顺手把这一轮已经采到的数据填成健康快照：面板上的三层小灯直接用它，
@@ -390,7 +394,10 @@ public final class VdCtl {
             log.print("  " + DEX + " (" + dexSize + " B)");
 
             if (step(2, 8, "停旧发送端（先 TERM 让 vd 模式把窗口搬回去）")) return false;
-            String out = killSender(cfg.pkg);
+            if (!prevPkg.isEmpty() && !prevPkg.equals(cfg.pkg)) {
+                log.print("  换应用：" + prevPkg + " → " + cfg.pkg + "，先按上一次的应用收干净");
+            }
+            String out = killSender(prevPkg.isEmpty() ? cfg.pkg : prevPkg);
             for (String line : tail(out, 3).split("\n")) {
                 if (!line.trim().isEmpty()) log.print("  " + line.trim());
             }
