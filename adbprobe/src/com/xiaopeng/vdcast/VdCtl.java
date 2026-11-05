@@ -44,6 +44,42 @@ public final class VdCtl {
         public int cY = 72;
         public int cW = 1920;
         public int cH = 568;
+
+        /**
+         * 把「仪表投屏矩形」和「发送尺寸」对齐。幂等，可以在任何时机反复调。
+         *
+         * 这段逻辑原来只写在 start() 的 cCustom 分支里，导致一个真实回退（UX-15）：
+         * 先投自定义矩形 550x384、再切回满宽横带，outW/outH 会一直停在 550x384，
+         * 于是拿着一块 550x384 的图往 1920x568 的带子里画 ——
+         * 实测 draw 2ms→21.5ms、total 36.8ms、27fps、画面拉伸。
+         *
+         * 现在两种情况都收敛到这里：满宽横带也必须显式把 outW/outH 打回 1920 x
+         * (720-top-bot)，绝不复用上一次的自定义值。
+         */
+        public void normalize() {
+            if (cCustom) {
+                cW = Math.max(2, Math.min(1920, cW));
+                cH = Math.max(2, Math.min(720, cH));
+                if (cX < 0) cX = 0;
+                if (cY < 0) cY = 0;
+                if (cX + cW > 1920) cX = 1920 - cW;
+                if (cY + cH > 720) cY = 720 - cH;
+            } else {
+                // 满宽横带：矩形由 top/bot 决定，忽略外部填进来的 cX/cY/cW/cH
+                cX = 0;
+                cY = top;
+                cW = 1920;
+                cH = Math.max(2, 720 - top - bot);
+            }
+            outW = cW;
+            outH = cH;
+        }
+
+        /** 投屏区像素数，用于按面积判断帧率预期（见 docs/B0-基线数据-v1.md §7） */
+        public int areaPx() { return cW * cH; }
+
+        /** 是否按「满宽横带」投（没有自定义矩形） */
+        public boolean isFullBand() { return !cCustom; }
     }
 
     private static final String DEX = "/data/local/tmp/vd.dex";
@@ -96,6 +132,15 @@ public final class VdCtl {
     private final Log log;
     private final Cfg cfg;
 
+    /**
+     * 本次真正投出去的目标应用（启动时快照）。
+     *
+     * stop / status 必须用它，而不是 cfg.pkg：投屏中用户可以在面板上换成别的应用，
+     * cfg.pkg 一改，停止时就会去「恢复新应用的窗口」，而真正在虚拟屏上的是旧应用 ——
+     * 旧窗口留在已销毁的虚拟屏上，正是 PERF-05 记录的那类隐患。
+     */
+    private String activePkg = "";
+
     /** 仪表端二进制：null 表示 APK 里没带，只能指望车机上已有或用 /sdcard 旁路 */
     private byte[] icrecv;
 
@@ -110,22 +155,34 @@ public final class VdCtl {
     /** 让调用方在启动前改参数（模式、fps、裁切等） */
     public Cfg cfg() { return cfg; }
 
+    /**
+     * 按 B0 实测标定给一条「这块面积大概能跑到多少帧」的预期（不是保证值）。
+     *
+     * 口径见 docs/B0-基线数据-v1.md §7：仪表端解码 ≈20~24 ns/px，60Hz 预算扣掉
+     * read/draw/flush 后只剩 10~11ms，所以面积上限约 45~55 万像素。
+     * 实测 55.0 万以下（550x384 = 21 万）跑满 61.8 帧，满宽横带 1920x568 = 109 万
+     * 只有 30~39 帧。这里只负责把话说清楚，不拦用户选大区域。
+     */
+    public static String fpsHint(int w, int h) {
+        long px = (long) w * h;
+        String area = String.format(Locale.US, "%.0f 万像素", px / 10000.0);
+        String band;
+        if (px <= 450000) band = "可跑满 60 帧";
+        else if (px <= 600000) band = "临界，约 55~60 帧";
+        else if (px <= 900000) band = "约 40~50 帧";
+        else band = "约 30~40 帧（接近满宽，物理上限）";
+        return area + "，" + band;
+    }
+
     // ============================================================ 启动
 
     public boolean start() {
         try {
-            // 自定义仪表区域先规范化：夹到 1920x720 内，并让发送尺寸跟矩形一致，
-            // 否则仪表端要拉伸，画面会扁/拉长。
-            if (cfg.cCustom) {
-                cfg.cW = Math.max(2, Math.min(1920, cfg.cW));
-                cfg.cH = Math.max(2, Math.min(720, cfg.cH));
-                if (cfg.cX < 0) cfg.cX = 0;
-                if (cfg.cY < 0) cfg.cY = 0;
-                if (cfg.cX + cfg.cW > 1920) cfg.cX = 1920 - cfg.cW;
-                if (cfg.cY + cfg.cH > 720) cfg.cY = 720 - cfg.cH;
-                cfg.outW = cfg.cW;
-                cfg.outH = cfg.cH;
-            }
+            // 自定义仪表区域 / 满宽横带都先规范化：夹到 1920x720 内，并让发送尺寸
+            // 跟矩形严格一致，否则仪表端要拉伸，画面会扁/拉长（UX-15）。
+            cfg.normalize();
+            // 投出去的就是这一刻的 pkg，之前/之后界面上再改都与本次投屏无关
+            activePkg = cfg.pkg;
             log.print("[0/8] 检查车机 adb（" + adb.endpoint + "）");
             String ok = adb.exec("echo car_ok", 8000);
             if (!ok.contains("car_ok")) {
@@ -134,6 +191,7 @@ public final class VdCtl {
             }
             log.print("  ok (mode=" + cfg.mode + ", 目标=" + cfg.pkg + ", "
                     + cfg.outW + "x" + cfg.outH + ", " + cfg.fps + "fps)");
+            log.print("  投屏区 " + cfg.cW + "x" + cfg.cH + "，" + fpsHint(cfg.cW, cfg.cH));
 
             // 发送端只认 vdcrop.txt（它靠这个文件热重载），所以启动前必须把界面上
             // 当前填的裁切值落盘，否则用户改了输入框没点「应用」就直接启动，
@@ -226,15 +284,21 @@ public final class VdCtl {
 
     public boolean stop() {
         try {
+            // 恢复窗口用「投出去的那一份」，不是界面上当前填的（可能已经被改成别的应用）
+            String pkg = activePkg.isEmpty() ? cfg.pkg : activePkg;
+            if (!pkg.equals(cfg.pkg)) {
+                log.print("  恢复目标用本次实际投出的应用：" + pkg
+                        + "（界面上现在填的是 " + cfg.pkg + "，不参与收尾）");
+            }
             log.print("[1/3] 停车机发送端");
-            String out = adb.exec("sh " + KILLVDS + " stop " + cfg.pkg
+            String out = adb.exec("sh " + KILLVDS + " stop " + pkg
                     + "; rm -f /data/local/tmp/vdcap", 45000);
             for (String line : tail(out, 8).split("\n")) {
                 if (!line.trim().isEmpty()) log.print("     " + line.trim());
             }
             log.print("     残留进程: " + adb.exec("sh " + KILLVDS + " check", 15000).trim());
             log.print("     窗口位置: " + oneLine(adb.exec("am stack list 2>/dev/null | grep -F "
-                    + cfg.pkg + " | head -1", 15000)));
+                    + pkg + " | head -1", 15000)));
             log.print("     残留虚拟屏: " + oneLine(adb.exec(
                     "dumpsys display | grep -c 'DisplayDeviceInfo{\"asxvd'", 15000)));
 
@@ -246,6 +310,12 @@ public final class VdCtl {
             logIndented(Icrpc.run(adb,
                     "grep -E 'RESTORE_OK|pixels restored|RESTORED blank' /tmp/icrecv.log | tail -2", 8, 40000));
             log.print("done");
+            activePkg = "";
+            // 恢复窗口会把目标应用搬回前台，面板整个被盖住 —— 用户点完「停止」看不到结果。
+            // 收尾完成后把自己拉回来（此时 restore 已完成，不会再被抢）
+            try {
+                adb.exec("am start -n " + SELF + "/.MainActivity", 12000);
+            } catch (Throwable ignored) { }
             return true;
         } catch (Throwable t) {
             log.print("!! 停止中断: " + brief(t));
@@ -264,7 +334,8 @@ public final class VdCtl {
                     + VDSEND_LOG + " | tail -3; grep 'fps=' " + VDSEND_LOG + " | tail -2", 15000));
             sb.append("\n=== 虚拟屏 / 目标窗口 ===\n");
             String vd = adb.exec("dumpsys display 2>/dev/null | grep -c 'DisplayDeviceInfo{\"asxvd'", 15000).trim();
-            String win = oneLine(adb.exec("am stack list 2>/dev/null | grep -F " + cfg.pkg + " | head -1", 15000));
+            String win = oneLine(adb.exec("am stack list 2>/dev/null | grep -F "
+                    + (activePkg.isEmpty() ? cfg.pkg : activePkg) + " | head -1", 15000));
             sb.append("  虚拟屏数: ").append(vd).append('\n');
             sb.append("  窗口: ").append(win).append('\n');
             sb.append("\n=== 仪表端（接收/合成） ===\n");

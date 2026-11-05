@@ -72,14 +72,12 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         portEdit.setText(sp.getString("port", String.valueOf(PORT_DEFAULT)));
         pkgEdit.setText(sp.getString("pkg", PKG_DEFAULT));
         if (clusterEdit != null) clusterEdit.setText(sp.getString("crect", CRECT_DEFAULT));
-        // 上次用过的设置直接打勾，一眼看出「只差哪一步」；连接是本次真的连上才算
-        step(1, sp.contains("pkg"));
-        step(2, sp.contains("crop"));
-        step(3, sp.contains("crect"));
+        // 流程条不再按 prefs 里有没有 key 打勾：配置存过不等于这次真的可用，
+        // 由 refreshUi 按界面上的实际内容推导（见 refreshUiNow）
+        refreshUi();
 
         print("仪表投屏 v2.0");
-        print("流程：选应用 → 框选裁切 → 框选仪表区域 → 启动 vd");
-        setState("待机", C_MUTED);
+        print("流程：选应用 → 仪表区域 → 裁切画面 → 启动投屏 → 预览");
         setBusy(false);
         handleIntent(getIntent());
     }
@@ -112,7 +110,7 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         print("遥控 → " + act);
         switch (act) {
             case "connect": run(() -> {
-                if (ensureConn()) { print("已连接 " + adb.endpoint); step(0, true); }
+                if (ensureConn()) print("已连接 " + adb.endpoint);
             });
                 break;
             case "apps":    run(this::dumpApps); break;
@@ -121,16 +119,17 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
             case "main":    run(() -> startWith("main")); break;
             case "stop":    run(() -> {
                 if (!ensureCtl()) return;
-                ctl.stop();
-                step(4, false);
-                step(5, false);
+                setPhase(Phase.STOPPING);
+                boolean ok = ctl.stop();
+                setPhase(ok ? Phase.CONNECTED : Phase.ERROR, ok ? "" : "停止未完成");
+                previewOpened = false;
             });
                 break;
             case "crop":    run(() -> {
                 if (!ensureCtl()) return;
                 ctl.setCrop(cropEdit.getText().toString());
                 savePrefs();
-                step(2, true);
+                refreshUi();
             });
                 break;
             case "status":  run(() -> { if (ensureCtl()) print(ctl.status()); }); break;
@@ -187,27 +186,112 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
     private static final int C_ACCENT = 0xFF2F81F7;
     private static final int C_DANGER = 0xFFE5484D;
     private static final int C_OK = 0xFF3DD68C;
+    /** 投屏中但配置已改（改了参数还没重新启动） */
+    private static final int C_WARN = 0xFFD29922;
 
     private LinearLayout root;
     private TextView stateChip;
 
     // ---------- 顶部流程条 ----------
-    // 以前操作步骤只写在日志第一行，一旦开始投屏就被刷走了。做成常驻的一排，
-    // 已完成绿、当前蓝、未做灰，一眼知道「还差哪一步」。
+    // 顺序按「先定仪表投屏区、再按它的宽高比框车机画面」排：投屏区决定投出去多大，
+    // 裁切框选要按这个比例锁框，反过来做等于先裁一次再重裁（UX-02）。
     private static final String[] STEP_NAMES =
-            {"连接", "选应用", "裁切画面", "仪表区域", "启动投屏", "预览"};
+            {"连接", "选应用", "仪表区域", "裁切画面", "启动投屏", "预览"};
     private final TextView[] stepViews = new TextView[STEP_NAMES.length];
     private final boolean[] stepDone = new boolean[STEP_NAMES.length];
 
-    private void step(int i, boolean on) {
-        if (i < 0 || i >= stepDone.length) return;
-        stepDone[i] = on;
-        runOnUiThread(this::refreshSteps);
+    /**
+     * 运行态：整个面板的单一真相源（B2）。
+     *
+     * 以前流程条是各回调里手工 step(i, true) 打出来的，于是出现三类「界面说谎」：
+     *   - onCreate 只按 prefs 里有没有这个 key 就打勾（存过 ≠ 这次能用）
+     *   - openPreview() 无条件把「预览」标成完成
+     *   - 换了应用 / 改了矩形之后，「启动投屏」还是绿的
+     * 现在只维护一个 phase + 界面上的真实配置，其余全部推导（refreshUi）。
+     */
+    private enum Phase { IDLE, CONNECTED, STARTING, CASTING, STOPPING, ERROR }
+
+    private volatile Phase phase = Phase.IDLE;
+    private String lastError = "";
+    /** 最近一次成功启动真正投出去的配置快照；与界面不一致就说明「需要重新启动」 */
+    private String launchedKey = "";
+    private String lastMode = "vd";
+    /** 本次「投屏中」期间打开过预览页 */
+    private boolean previewOpened;
+
+    private void setPhase(Phase p) { setPhase(p, ""); }
+
+    private void setPhase(Phase p, String err) {
+        phase = p;
+        lastError = err == null ? "" : err;
+        refreshUi();
     }
 
-    private void refreshSteps() {
+    private static String keyOf(String pkg, String crop, String crect, String mode) {
+        return pkg + "|" + crop + "|" + crect + "|" + mode;
+    }
+
+    private void refreshUi() {
+        runOnUiThread(this::refreshUiNow);
+    }
+
+    /**
+     * 一次把「状态药丸 + 流程条 + 按钮可用性」刷到位。
+     * 幂等：任何地方状态变了只调它，不做局部改文字。
+     */
+    private void refreshUiNow() {
+        if (stateChip == null) return;
+        String pkg = txt(pkgEdit), crop = txt(cropEdit), crect = txt(clusterEdit);
+        boolean hasPkg = !pkg.isEmpty();
+        boolean hasCrop = crop.matches("\\d+,\\d+,\\d+,\\d+");
+        boolean hasCrect = crect.matches("\\d+,\\d+,\\d+,\\d+");
+        boolean fresh = phase == Phase.CASTING
+                && keyOf(pkg, crop, crect, lastMode).equals(launchedKey);
+        // 投屏中，但界面配置已经和投出去的那份不一致 —— 必须重新启动才生效
+        boolean stale = phase == Phase.CASTING && !fresh;
+
+        stepDone[0] = phase != Phase.IDLE;
+        stepDone[1] = hasPkg;
+        stepDone[2] = hasCrect;
+        stepDone[3] = hasCrop;
+        stepDone[4] = fresh;
+        stepDone[5] = fresh && previewOpened;
         int cur = 0;
         while (cur < stepDone.length && stepDone[cur]) cur++;
+        paintSteps(cur);
+
+        String s;
+        int c;
+        switch (phase) {
+            case CONNECTED: s = "已连接";   c = C_OK;     break;
+            case STARTING:  s = "启动中…";  c = C_ACCENT; break;
+            case CASTING:
+                if (stale) { s = "投屏中 · 配置已改"; c = C_WARN; }
+                else       { s = "投屏中";            c = C_OK; }
+                break;
+            case STOPPING:  s = "停止中…";  c = C_ACCENT; break;
+            case ERROR:     s = "失败";     c = C_DANGER; break;
+            default:        s = "待机";     c = C_MUTED;  break;
+        }
+        stateChip.setText(s);
+        stateChip.setTextColor(c);
+        stateChip.setBackground(round(0x22000000 | (c & 0xFFFFFF), 0, dp(20)));
+
+        // 按钮：只按「有没有可能成功」禁用，不按状态机猜到的运行态禁用 ——
+        // 状态机可能落后于车机（比如车机重启了），「停止」永远留一条手动兜底的路。
+        btnStartVd.setEnabled(hasPkg && !busy);
+        btnStartMain.setEnabled(hasPkg && !busy);
+        btnStop.setEnabled(!busy);
+        btnStatus.setEnabled(!busy);
+        btnCrop.setEnabled(!busy);
+        btnProbe.setEnabled(!busy);
+        btnPick.setEnabled(!busy);
+        btnFrame.setEnabled(!busy);
+        btnCluster.setEnabled(!busy);
+        btnPreview.setEnabled(!busy);
+    }
+
+    private void paintSteps(int cur) {
         for (int i = 0; i < stepViews.length; i++) {
             TextView t = stepViews[i];
             if (t == null) continue;
@@ -227,6 +311,10 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         }
     }
 
+    private static String txt(EditText e) {
+        return e == null ? "" : e.getText().toString().trim();
+    }
+
     private View buildUi() {
         root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -234,13 +322,18 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         root.setPadding(dp(14), dp(6), dp(14), dp(6));
 
         // ---------- 顶栏：标题 + 状态 ----------
+        // 状态胶囊紧贴标题，不再用 spacer 推到最右：面板窗口铺到屏幕右缘，
+        // 最右侧是系统状态栏（铃铛/电量/时间），推过去就被压住看不见了。
         LinearLayout head = row();
         TextView title = text("仪表投屏", 34, C_TEXT);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         head.addView(title);
-        head.addView(spacer());
         stateChip = chip("待机", C_MUTED);
-        head.addView(stateChip);
+        LinearLayout.LayoutParams chipLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        chipLp.leftMargin = dp(10);
+        head.addView(stateChip, chipLp);
+        head.addView(spacer());
         root.addView(head);
 
         // ---------- 流程条（常驻，不随日志滚走） ----------
@@ -262,7 +355,8 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         hs.addView(steps);
         root.addView(hs, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        refreshSteps();
+        // 先画一遍空态（refreshUi 会在 onCreate 里补齐真实状态）
+        paintSteps(0);
 
         LinearLayout body = new LinearLayout(this);
         body.setOrientation(LinearLayout.VERTICAL);
@@ -279,8 +373,18 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         body.addView(c1);
 
         // ---------- 区域 ----------
+        // 顺序有意：先定「投到仪表哪里」，再框「车机取哪块」。
+        // 裁切框选按投屏区的宽高比锁比例，反过来排会先裁一次再返工（UX-02）。
         LinearLayout c2 = card();
-        c2.addView(label("车机画面裁切  x, y, w, h"));
+        c2.addView(label("仪表投屏区域  1920×720 坐标，默认满宽横带"));
+        LinearLayout r3 = row();
+        clusterEdit = input("0,72,1920,568");
+        r3.addView(clusterEdit, weight());
+        btnCluster = mkButton("框选");
+        r3.addView(btnCluster);
+        c2.addView(r3);
+
+        c2.addView(label("车机画面裁切  x, y, w, h（按投屏区比例锁框）"));
         LinearLayout r2 = row();
         cropEdit = input("960,345,1440,426");
         r2.addView(cropEdit, weight());
@@ -289,14 +393,6 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         r2.addView(btnFrame);
         r2.addView(btnCrop);
         c2.addView(r2);
-
-        c2.addView(label("仪表投屏区域  1920×720 坐标，默认满宽横带"));
-        LinearLayout r3 = row();
-        clusterEdit = input("0,72,1920,568");
-        r3.addView(clusterEdit, weight());
-        btnCluster = mkButton("框选");
-        r3.addView(btnCluster);
-        c2.addView(r3);
         body.addView(c2);
 
         // ---------- 操作 ----------
@@ -368,23 +464,38 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         root.addView(c4);
 
         // ---------- 事件 ----------
+        // 手改参数也要立刻反映到流程条：改了应用/矩形/裁切而没重新启动，
+        // 「启动投屏」应该马上变灰，状态药丸变成「配置已改」
+        android.text.TextWatcher cfgWatcher = new android.text.TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int st, int c, int a) { }
+
+            @Override
+            public void onTextChanged(CharSequence s, int st, int b, int c) { }
+
+            @Override
+            public void afterTextChanged(android.text.Editable s) { refreshUi(); }
+        };
+        pkgEdit.addTextChangedListener(cfgWatcher);
+        cropEdit.addTextChangedListener(cfgWatcher);
+        clusterEdit.addTextChangedListener(cfgWatcher);
+
         btnConnect.setOnClickListener(v -> run(() -> {
-            if (ensureConn()) {
-                print("已连接 " + adb.endpoint);
-                step(0, true);
-            }
+            if (ensureConn()) print("已连接 " + adb.endpoint);
         }));
 
         btnStartVd.setOnClickListener(v -> run(() -> startWith("vd")));
         btnStartMain.setOnClickListener(v -> run(() -> startWith("main")));
 
         btnStop.setOnClickListener(v -> run(() -> {
+            // 状态机可能落后于车机（车机重启 / 掉线后语义就错了），所以「停止」
+            // 永远可点：没在投也让它真去收一遍尾，而不是靠界面判断直接跳过。
+            if (phase != Phase.CASTING) print("当前面板认为没有在投屏，照样执行一遍收尾");
             if (!ensureCtl()) return;
-            if (ctl.stop()) {
-                setState("已停止", C_MUTED);
-                step(4, false);
-                step(5, false);
-            }
+            setPhase(Phase.STOPPING);
+            boolean ok = ctl.stop();
+            previewOpened = false;
+            setPhase(ok ? Phase.CONNECTED : Phase.ERROR, ok ? "" : "停止未完成");
         }));
 
         btnStatus.setOnClickListener(v -> run(() -> {
@@ -398,7 +509,7 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
             if (!ensureCtl()) return;
             ctl.setCrop(cropEdit.getText().toString());
             savePrefs();
-            step(2, true);
+            refreshUi();
         }));
 
         btnPick.setOnClickListener(v -> run(this::pickApp));
@@ -503,16 +614,6 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
 
     private Button mkDanger(String s) { return btn(s, 0xFF3A1D20, 0xFFFF8A8F); }
 
-    /** 状态 chip：startWith 是在工作线程里调的，碰 View 必须回 UI 线程 */
-    private void setState(String s, int color) {
-        runOnUiThread(() -> {
-            if (stateChip == null) return;
-            stateChip.setText(s);
-            stateChip.setTextColor(color);
-            stateChip.setBackground(round(0x22000000 | (color & 0xFFFFFF), 0, dp(20)));
-        });
-    }
-
     private EditText input(String hint) {
         EditText e = new EditText(this);
         e.setTextSize(TypedValue.COMPLEX_UNIT_PX, 28);
@@ -574,10 +675,14 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
                     .setAdapter(ad, (d, which) -> {
                         String pkg = apps.get(which);
                         pkgEdit.setText(pkg);
-                        if (ctl != null) ctl.cfg().pkg = pkg;
+                        // 不在这里改 ctl.cfg().pkg：cfg 里的 pkg 属于「本次投出去的配置」，
+                        // 由 startWith 在启动时快照一次。投屏中换应用后立刻改它，
+                        // 停止时就会去恢复新应用的窗口，真正在虚拟屏上的旧窗口没人管。
                         savePrefs();
                         print("目标应用 -> " + pkg);
-                        step(1, true);
+                        // 投屏中换应用：refreshUi 会发现「界面配置 ≠ 已投出的快照」，
+                        // 把「启动投屏」重新变灰，提示需要再启动一次（UI-07）
+                        refreshUi();
                     })
                     .setNegativeButton("取消", null)
                     .show();
@@ -597,6 +702,9 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
     private void frameCrop() {
         if (!ensureCtl()) return;
         try {
+            // 先把界面上的仪表矩形灌进 cfg 再取尺寸：框选页要用 outW/outH 锁比例，
+            // 拿到上一次的旧比例会把画面裁歪（UI-13）。
+            applyClusterCfg();
             print("取当前画面作底图…");
             byte[] png = ctl.snapshot();
             File f = new File(getCacheDir(), "crop.png");
@@ -632,9 +740,11 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
             if (r != null) {
                 clusterEdit.setText(r);
                 savePrefs();
+                // ctl 还没建（没连过 adb）时不用急：startWith / frameCrop 都会再同步一次
+                if (ctl != null) applyClusterCfg();
                 print("仪表投屏区 -> " + r
                         + (data.getBooleanExtra("custom", false) ? "（自定义）" : "（满宽横带）"));
-                step(3, true);
+                refreshUi();
             }
             return;
         }
@@ -648,15 +758,26 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         cropEdit.setText(crop);
         savePrefs();
         print("框选结果 " + crop);
-        step(2, true);
+        refreshUi();
         run(() -> {
             if (!ensureCtl()) return;
             ctl.setCrop(crop);
         });
     }
 
-    /** 实时预览：全屏看 VD 里那块画面（数据来自发送端的本地预览端口） */
+    /**
+     * 实时预览：全屏看 VD 里那块画面（数据来自发送端的本地预览端口）。
+     *
+     * 只能在投屏中开：画面是发送端在 5570 上现推的，没启动就没有流。
+     * 以前这里无条件把「预览」流程项标成完成，等于骗用户（UI-10）。
+     * 「启动前先看合成效果」要走静态预演，那是 B4 的事。
+     */
     private void openPreview() {
+        if (phase != Phase.CASTING && phase != Phase.STARTING) {
+            print("还没启动投屏：预览画面来自发送端的实时流（端口 "
+                    + (ctl != null ? ctl.cfg().previewPort : 5570) + "），先启动再看");
+            return;
+        }
         int port = ctl != null ? ctl.cfg().previewPort : 5570;
         Intent i = new Intent(this, PreviewActivity.class);
         i.putExtra("port", port);
@@ -664,7 +785,8 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         i.putExtra("crop", cropEdit.getText().toString().trim());
         i.putExtra("crect", clusterEdit.getText().toString().trim());
         startActivity(i);
-        step(5, true);
+        previewOpened = true;
+        refreshUi();
     }
 
     /** 打开仪表区域选择页（底图是打包进来的 fb0_pre.png，原生 1920x720） */    private void pickClusterArea() {
@@ -677,7 +799,9 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
 
     /** 把界面上的仪表矩形写进 cfg；解析失败就退回满宽横带，绝不让脏值传到仪表端 */
     private void applyClusterCfg() {
-        int x = 0, y = 72, w = 1920, h = 568;
+        final int defY = ctl.cfg().top;
+        final int defH = 720 - ctl.cfg().top - ctl.cfg().bot;
+        int x = 0, y = defY, w = 1920, h = defH;
         boolean ok = false;
         String s = clusterEdit.getText().toString().trim();
         String[] p = s.split(",");
@@ -691,14 +815,17 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
             } catch (Exception ignored) { }
         }
         if (!ok) {
-            x = 0; y = 72; w = 1920; h = 568;
+            x = 0; y = defY; w = 1920; h = defH;
             print("仪表区域格式不对，按默认满宽横带启动");
         }
-        ctl.cfg().cCustom = !(x == 0 && y == 72 && w == 1920 && h == 568);
+        ctl.cfg().cCustom = !(x == 0 && y == defY && w == 1920 && h == defH);
         ctl.cfg().cX = x;
         ctl.cfg().cY = y;
         ctl.cfg().cW = w;
         ctl.cfg().cH = h;
+        // 立刻对齐 outW/outH：框选页要用它锁比例，启动前也要靠它算发送尺寸。
+        // 以前只在 start() 里同步，改完矩形马上去框选会锁到上一次的比例（UI-13）。
+        ctl.cfg().normalize();
     }
 
     private void startWith(String mode) {
@@ -714,16 +841,23 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         ctl.cfg().crop = cropEdit.getText().toString().trim();
         applyClusterCfg();
         savePrefs();
-        setState("启动中…", C_ACCENT);
+        lastMode = mode;
+        previewOpened = false;
+        setPhase(Phase.STARTING);
         boolean ok = ctl.start();
         if (ok && !ctl.binMd5().isEmpty()) {
             // 记下「仪表上现在跑的是这一份」，下次开 App 直接命中快路径
             getPreferences(MODE_PRIVATE).edit().putString("binMd5", ctl.binMd5()).apply();
         }
-        setState(ok ? "投屏中" : "启动失败", ok ? C_OK : C_DANGER);
-        step(0, true);
-        step(4, ok);
-        if (!ok) step(5, false);
+        if (ok) {
+            // 记下「真正投出去的那一份配置」：之后界面任何一项改了，
+            // refreshUi 都会把「启动投屏」重新变灰（UI-07）
+            launchedKey = keyOf(pkg, txt(cropEdit), txt(clusterEdit), mode);
+            setPhase(Phase.CASTING);
+        } else {
+            launchedKey = "";
+            setPhase(Phase.ERROR, "启动失败");
+        }
     }
 
     private int dp(int v) {
@@ -753,20 +887,20 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
 
     private void setBusy(boolean b) {
         busy = b;
-        btnStartVd.setEnabled(!b);
-        btnStartMain.setEnabled(!b);
-        btnStop.setEnabled(!b);
-        btnStatus.setEnabled(!b);
-        btnCrop.setEnabled(!b);
-        btnProbe.setEnabled(!b);
-        btnPick.setEnabled(!b);
-        btnFrame.setEnabled(!b);
-        btnCluster.setEnabled(!b);
-        btnPreview.setEnabled(!b);
+        // 按钮可用性统一由 refreshUi 决定，这里只翻标志再刷一遍
+        refreshUi();
+    }
+
+    /** 连上了：只在「还没进入链路」时把 phase 拨到 CONNECTED，别覆盖 CASTING/STARTING */
+    private void markConnected() {
+        if (phase == Phase.IDLE || phase == Phase.ERROR) setPhase(Phase.CONNECTED);
     }
 
     private boolean ensureConn() {
-        if (adb.isConnected()) return true;
+        if (adb.isConnected()) {
+            markConnected();
+            return true;
+        }
         int port;
         try {
             port = Integer.parseInt(portEdit.getText().toString().trim());
@@ -788,17 +922,25 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
             adb.setKey(key);
 
             print("连接 127.0.0.1:" + port + " …");
-            if (adb.connect("127.0.0.1", port, 90)) return true;
+            if (adb.connect("127.0.0.1", port, 90)) {
+                markConnected();
+                return true;
+            }
 
             // adbd 可能只绑在网卡地址上，兜底试本机各网卡 IP
             for (String ip : localIpv4()) {
                 print("连接 " + ip + ":" + port + " …");
-                if (adb.connect(ip, port, 90)) return true;
+                if (adb.connect(ip, port, 90)) {
+                    markConnected();
+                    return true;
+                }
             }
             print("!! 连不上 adbd。检查开发者选项里的 USB 调试是否开着、端口是否 " + port);
+            setPhase(Phase.ERROR, "连不上 adbd");
             return false;
         } catch (Throwable t) {
             print("!! 连接失败: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+            setPhase(Phase.ERROR, "连接失败");
             return false;
         }
     }
@@ -860,6 +1002,9 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
             if (ic.length > 0) print("仪表端程序已内置（" + ic.length + " B）");
             // 上次成功投送到仪表的那份 md5：命中就不用再查仪表、更不用重推
             ctl.setKnownBinMd5(getPreferences(MODE_PRIVATE).getString("binMd5", ""));
+            // 界面上的仪表矩形（来自 prefs 或遥控参数）一建好 cfg 就灌进去，
+            // 别等到点「启动」才同步：框选页、状态显示都要用正确的 outW/outH
+            applyClusterCfg();
         }
         return true;
     }
