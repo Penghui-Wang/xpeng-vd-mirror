@@ -141,6 +141,16 @@ public final class VdCtl {
      */
     private String activePkg = "";
 
+    /**
+     * 本次进程里仪表接收端「真的起来过」。restore 幂等的依据：
+     *
+     * 没起过接收端，仪表 fb1 根本没被碰过，这时候去等 RESTORE 标记是白等（一次 RPC 1.5~2s），
+     * 而且永远等不到 → 会被误报成「恢复失败」。所以只有起过才要求看到恢复标记。
+     */
+    private boolean receiverEverStarted;
+    /** 仪表已确认恢复原版面（看到 RESTORE_OK / pixels restored / RESTORED blank） */
+    private boolean receiverRestored = true;
+
     /** 仪表端二进制：null 表示 APK 里没带，只能指望车机上已有或用 /sdcard 旁路 */
     private byte[] icrecv;
 
@@ -183,6 +193,10 @@ public final class VdCtl {
             cfg.normalize();
             // 投出去的就是这一刻的 pkg，之前/之后界面上再改都与本次投屏无关
             activePkg = cfg.pkg;
+            // 顺手把这一轮已经采到的数据填成健康快照：面板上的三层小灯直接用它，
+            // 不用再额外跑一次 health()（那要 2 秒，会把「启动到出画面」拖长）
+            lastStartHealth = new Health();
+            lastStartHealth.adbOk = true;
             log.print("[0/8] 检查车机 adb（" + adb.endpoint + "）");
             String ok = adb.exec("echo car_ok", 8000);
             if (!ok.contains("car_ok")) {
@@ -228,6 +242,7 @@ public final class VdCtl {
                                    : "满宽横带 y=" + cfg.top + ".." + (720 - cfg.bot))
                     + "）");
             int alive = startReceiver();
+            lastStartHealth.receiver = alive;
             log.print("  接收端进程: " + alive + "（应为 1）");
 
             log.print("[6/8] 起车机发送端（shell 域，mode=" + cfg.mode + "，" + cfg.fps + " fps）");
@@ -238,11 +253,15 @@ public final class VdCtl {
             // 仪表侧也轮询：日志里出现 frames= 就说明真的收到帧了，不用再干等。
             // 上限 5 秒，超了照样往下走（真没帧的话 [8/8] 会报出来）。
             // 放在车机速率之前：这一步本来就要一秒多，正好让 VdSend 把第一行 fps= 打出来。
-            logIndented(Icrpc.run(adb, "i=0; while [ $i -lt 25 ]; do "
+            String icOut = Icrpc.run(adb, "i=0; while [ $i -lt 25 ]; do "
                     + "grep -q 'frames=' /tmp/icrecv.log && break; i=$((i+1)); sleep 0.2; done; "
-                    + "grep -E 'frames=|LISTEN|VISIBLE|DST ' /tmp/icrecv.log | tail -3", 8, 45000));
+                    + "grep -E 'frames=|LISTEN|VISIBLE|DST ' /tmp/icrecv.log | tail -3", 8, 45000);
+            logIndented(icOut);
+            lastStartHealth.icFps = maxOf(lastStartHealth.icFps, num(icOut, "(\\d+(?:\\.\\d+)?)fps"));
             log.print("  --- 车机：采集/发送 ---");
-            logIndented(adb.exec("grep 'fps=' " + VDSEND_LOG + " | tail -2", 10000));
+            String carOut = adb.exec("grep 'fps=' " + VDSEND_LOG + " | tail -2", 10000);
+            logIndented(carOut);
+            lastStartHealth.carFps = maxOf(lastStartHealth.carFps, num(carOut, "fps=(\\d+(?:\\.\\d+)?)"));
 
             log.print("[8/8] 健康检查");
             // 两件小事合成一次往返：异常计数 + 发送端存活数
@@ -257,6 +276,9 @@ public final class VdCtl {
                 else if (t.startsWith("PROC=")) proc = t.substring(5).trim();
             }
             log.print("  车机异常计数: " + (bad.isEmpty() ? "0" : bad));
+            lastStartHealth.sender = parseInt(proc);
+            // 发送端没起来时，日志里的 fps 是上一轮的，别拿来点灯
+            if (lastStartHealth.sender <= 0) lastStartHealth.carFps = -1;
             if ("vd".equals(cfg.mode)) {
                 // 用 runningTasks 解析，别再用 grep 拼 am stack list 的文本：
                 // 窗口搬进虚拟屏之后 RootTask 段落格式会变，grep 常常一无所获，误报「未找到」。
@@ -282,7 +304,25 @@ public final class VdCtl {
 
     // ============================================================ 停止
 
-    public boolean stop() {
+    /** 不限预算的停止（PC 遥控、手动点「停止」用） */
+    public boolean stop() { return stop(0L); }
+
+    /**
+     * 停止投屏，并把「车机发送端退出」与「仪表 fb1 恢复」都确认到位（UX-12）。
+     *
+     * 返回值语义收紧了：以前只要命令没抛异常就 return true，于是「仪表没恢复原版面」
+     * 也算成功 —— 这是安全相关部件，必须只认恢复标记。
+     *
+     * @param deadlineAt System.currentTimeMillis() 的截止点；0 = 不限。
+     *                   退出应用给 8 秒预算（UX-05），超了就明确报「哪一步没走完」，
+     *                   不静默退出、也不假装成功。
+     */
+    public boolean stop(long deadlineAt) {
+        long t0 = System.currentTimeMillis();
+        boolean carOk = false;
+        // 没起过接收端时仪表本来就没被改动，天然算恢复好了；只有起过才要求看到恢复标记
+        boolean restoreOk = true;
+        int residualCar = -1;
         try {
             // 恢复窗口用「投出去的那一份」，不是界面上当前填的（可能已经被改成别的应用）
             String pkg = activePkg.isEmpty() ? cfg.pkg : activePkg;
@@ -290,38 +330,237 @@ public final class VdCtl {
                 log.print("  恢复目标用本次实际投出的应用：" + pkg
                         + "（界面上现在填的是 " + cfg.pkg + "，不参与收尾）");
             }
-            log.print("[1/3] 停车机发送端");
+            log.print("[1/4] 停车机发送端");
+            // killvds stop 里有固定 sleep 2 等虚拟屏销毁 + restore 进程，实测 4.3s，
+            // 这一步是退出预算里最贵的一段（B5 才动它）
             String out = adb.exec("sh " + KILLVDS + " stop " + pkg
                     + "; rm -f /data/local/tmp/vdcap", 45000);
             for (String line : tail(out, 8).split("\n")) {
                 if (!line.trim().isEmpty()) log.print("     " + line.trim());
             }
-            log.print("     残留进程: " + adb.exec("sh " + KILLVDS + " check", 15000).trim());
+            String check = adb.exec("sh " + KILLVDS + " check", 15000).trim();
+            residualCar = parseInt(lastLine(check));
+            carOk = residualCar == 0;
+            log.print("     残留进程: " + residualCar + (carOk ? "  [OK]" : "  [未清空]"));
             log.print("     窗口位置: " + oneLine(adb.exec("am stack list 2>/dev/null | grep -F "
                     + pkg + " | head -1", 15000)));
             log.print("     残留虚拟屏: " + oneLine(adb.exec(
                     "dumpsys display | grep -c 'DisplayDeviceInfo{\"asxvd'", 15000)));
 
-            log.print("[2/3] 停仪表接收端（SIGTERM -> restore）");
+            log.print("[2/4] 停仪表接收端（SIGTERM -> restore）");
             int alive = stopReceiver();
             log.print("     残留进程: " + alive);
 
-            log.print("[3/3] 确认仪表已恢复原版面");
-            logIndented(Icrpc.run(adb,
-                    "grep -E 'RESTORE_OK|pixels restored|RESTORED blank' /tmp/icrecv.log | tail -2", 8, 40000));
-            log.print("done");
+            log.print("[3/4] 确认仪表已恢复原版面");
+            if (!receiverEverStarted) {
+                log.print("     本次没起过仪表接收端，fb1 未被改动，无需恢复");
+            } else if (overBudget(deadlineAt)) {
+                restoreOk = false;
+                log.print("     !! 预算用尽，跳过恢复确认");
+            } else {
+                restoreOk = confirmRestore();
+                if (!restoreOk && !overBudget(deadlineAt)) {
+                    // 多数是时序：TERM 之后日志落盘晚一点。补一次收尾再复查；
+                    // 真挂住了也靠这一轮补刀（SIGTERM 幂等，进程没了就什么都不做）。
+                    log.print("     未看到恢复标记，补一次收尾并复查");
+                    int alive2 = stopReceiver();
+                    log.print("     残留进程: " + alive2);
+                    restoreOk = confirmRestore();
+                }
+            }
+            // 只有确认恢复了才清标记。失败时保留 —— 否则第二次点「停止」会直接跳过
+            // 验证并报「收尾完成」，把第一次的红灯悄悄抹掉，等于从没发现过问题。
+            if (restoreOk) receiverEverStarted = false;
+            receiverRestored = restoreOk;
+
+            log.print("[4/4] 结论");
+            boolean ok = carOk && restoreOk;
+            if (ok) {
+                log.print("  收尾完成，用时 " + (System.currentTimeMillis() - t0) + " ms");
+            } else {
+                if (!carOk) {
+                    log.print("  !! 车机发送端未确认退出（残留 " + residualCar + " 个）");
+                }
+                if (!restoreOk) {
+                    log.print("  !! 仪表未确认恢复原版面：仪表可能停在投屏画面上");
+                    log.print("     处理：重开一次「停止」，或断电重启仪表；日志在仪表 /tmp/icrecv.log");
+                }
+            }
             activePkg = "";
             // 恢复窗口会把目标应用搬回前台，面板整个被盖住 —— 用户点完「停止」看不到结果。
             // 收尾完成后把自己拉回来（此时 restore 已完成，不会再被抢）
             try {
                 adb.exec("am start -n " + SELF + "/.MainActivity", 12000);
             } catch (Throwable ignored) { }
-            return true;
+            log.print("done");
+            return ok;
         } catch (Throwable t) {
             log.print("!! 停止中断: " + brief(t));
+            receiverRestored = false;
             return false;
         }
     }
+
+    /** 预算到了没（deadlineAt=0 表示不限） */
+    private static boolean overBudget(long deadlineAt) {
+        return deadlineAt > 0 && System.currentTimeMillis() >= deadlineAt;
+    }
+
+    /**
+     * 清理本次投屏留在车机上的临时文件，返回剩余 .adbprobe_* 个数。
+     *
+     * 刻意不删 vd.dex 和 /tmp/icrecv_dbg：那两样是「已投送产物」，删掉的话下次启动
+     * 要多等 10~30s 重推（UX-05 定案）。这里只清一次性的 RPC 帧、截图、relay 脚本。
+     */
+    public int cleanupTemp() {
+        try {
+            String r = adb.exec("rm -f /data/local/tmp/vdcap /data/local/tmp/_vdcrop.png "
+                    + "/data/local/tmp/.adbprobe_nc.pid /data/local/tmp/.adbprobe_relay.sh "
+                    + "/data/local/tmp/.adbprobe_f*.bin /data/local/tmp/.adbprobe_r*.out; "
+                    + "ls /data/local/tmp/.adbprobe_* 2>/dev/null | wc -l", 15000).trim();
+            return parseInt(lastLine(r));
+        } catch (Throwable t) {
+            log.print("!! 清理临时文件失败: " + brief(t));
+            return -1;
+        }
+    }
+
+    /**
+     * 仪表恢复判定，以恢复标记为唯一成功判据（UX-12）。
+     *
+     * 接收端收到 SIGTERM 后会先把 fb1 的原内容写回去再退出；只有这些标记出现，
+     * 才说明画面真的回来了。「进程没了」不等于「画面回来了」—— 进程被 SIGKILL 时
+     * 不会 restore，仪表会一直停在最后一帧投屏画面上。
+     */
+    private boolean confirmRestore() throws IOException {
+        String out = Icrpc.run(adb,
+                "grep -E 'RESTORE_OK|pixels restored|RESTORED blank' /tmp/icrecv.log | tail -3", 8, 40000);
+        logIndented(out);
+        return out.contains("RESTORE_OK") || out.contains("pixels restored")
+                || out.contains("RESTORED blank");
+    }
+
+    // ============================================================ 三层小灯
+
+    /**
+     * 面板上三个小灯的状态（UI-10）。
+     *
+     * 为什么要单独探一轮：状态机只知道「上次启动成没成功」，不知道现在还行不行。
+     * adb 掉线、发送端崩掉、接收端被别人杀了 —— 这三种在旧面板上看起来完全一样
+     * （都是「投屏中」），而恢复手段完全不同，所以必须分开测。
+     */
+    public static final class Health {
+        /** adb 通道活着（车机回了心跳） */
+        public boolean adbOk;
+        /** 车机发送端进程数；-1 = 没测出来 */
+        public int sender = -1;
+        /** 仪表接收端进程数；-1 = 没测出来 */
+        public int receiver = -1;
+        /** 车机侧实测帧率；<0 = 没有 */
+        public double carFps = -1;
+        /** 仪表侧实测帧率；<0 = 没有 */
+        public double icFps = -1;
+        /** 车机上 asxvd 虚拟屏个数（字符串，可能为空） */
+        public String vd = "";
+        public long costMs;
+
+        public String carsFpsText() {
+            return carFps < 0 ? "--" : String.format(Locale.US, "%.0f", carFps);
+        }
+
+        public String icFpsText() {
+            return icFps < 0 ? "--" : String.format(Locale.US, "%.1f", icFps);
+        }
+    }
+
+    /**
+     * 探一轮真实健康度：一次 adb 往返拿车机侧全部信息，再一次 RPC 拿仪表侧。
+     *
+     * 成本 ≈ 一次 exec（几十毫秒）+ 一次 Icrpc（1.5~2s）。所以只在「手动刷新」
+     * 和「启动/停止刚结束」时调，别挂进 refreshUi —— 那会把 UI 拖成幻灯片。
+     */
+    public Health health() {
+        Health h = new Health();
+        long t0 = System.currentTimeMillis();
+        try {
+            String car = adb.exec("echo HB; echo PROC=$(sh " + KILLVDS + " check 2>/dev/null); "
+                    + "echo VD=$(dumpsys display 2>/dev/null | grep -c 'DisplayDeviceInfo{\"asxvd'); "
+                    + "grep 'fps=' " + VDSEND_LOG + " 2>/dev/null | tail -1", 20000);
+            h.adbOk = car.contains("HB");
+            for (String line : car.split("\n")) {
+                String t = line.replace("\r", "").trim();
+                int q = t.indexOf("PROC=");
+                if (q >= 0) h.sender = parseInt(numText(t, q + 5));
+                else if ((q = t.indexOf("VD=")) >= 0) h.vd = numText(t, q + 3);
+                else h.carFps = maxOf(h.carFps, num(t, "fps=(\\d+(?:\\.\\d+)?)"));
+            }
+            if (!h.adbOk) {
+                h.costMs = System.currentTimeMillis() - t0;
+                return h;
+            }
+
+            // 仪表侧：进程数用「拆串防自命中」的写法，否则执行这条命令的 shell
+            // 自己的命令行里就有 icrecv_dbg，永远会多数出 1 个。
+            // 只取带 fps 的 frames 行：接收端退出时会补一行 `stream idle/end: EOF (frames=N)`，
+            // 那行没有帧率，拿它当最新状态会误报「没在出帧」。
+            String pattern = splitPattern("icrecv_", "dbg");
+            String ic = Icrpc.run(adb, pattern
+                    + "echo RECV=$(ps -o pid,args | grep -F \"$PAT\" | grep -v grep | wc -l); "
+                    + "grep -E 'frames=.*fps' /tmp/icrecv.log 2>/dev/null | tail -1", 5, 40000);
+            for (String line : ic.split("\n")) {
+                String t = line.replace("\r", "").trim();
+                // 回包前面常粘着 protobuf 头的可打印残渣（形如 `+.)RECV=0`），
+                // 所以不能 startsWith，必须按子串找
+                int q = t.indexOf("RECV=");
+                if (q >= 0) h.receiver = parseInt(numText(t, q + 5));
+                else h.icFps = maxOf(h.icFps, num(t, "(\\d+(?:\\.\\d+)?)fps"));
+            }
+            // 没有进程时，日志里的 fps 是「上一轮投屏」留下的，不能当现状显示
+            if (h.sender <= 0) h.carFps = -1;
+            if (h.receiver <= 0) h.icFps = -1;
+        } catch (Throwable t) {
+            log.print("!! 健康检查中断: " + brief(t));
+        }
+        h.costMs = System.currentTimeMillis() - t0;
+        return h;
+    }
+
+    /** 从一行文本里按正则取第一个数字；取不到返回 -1 */
+    private static double num(String s, String regex) {
+        try {
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile(regex).matcher(s);
+            if (m.find()) return Double.parseDouble(m.group(1));
+        } catch (Throwable ignored) { }
+        return -1;
+    }
+
+    /** 取两者中更大的那个（多行日志里会有历史帧率，留最新一次即可） */
+    private static double maxOf(double a, double b) {
+        if (b < 0) return a;
+        return b;   // 日志是顺序的，后出现的覆盖前面的
+    }
+
+    /** 从 from 之后取第一段连续数字，返回文本（容忍后面还跟着别的字） */
+    private static String numText(String s, int from) {
+        int i = Math.max(0, from);
+        while (i < s.length() && !Character.isDigit(s.charAt(i))) i++;
+        int st = i;
+        while (i < s.length() && Character.isDigit(s.charAt(i))) i++;
+        return st == i ? "" : s.substring(st, i);
+    }
+
+    /** 仪表侧是否已确认恢复（退出时判断要不要拦一下） */
+    public boolean isRestored() { return receiverRestored; }
+
+    /**
+     * 本次启动过程中顺手采到的健康快照（零额外成本）。
+     *
+     * 面板上的三层小灯优先用它：启动流程本来就已经拿到了「接收端进程数」「车机 fps」
+     * 「仪表 fps」「发送端进程数」，再单跑一次 health() 纯属白花 2 秒。
+     */
+    private Health lastStartHealth;
+
+    public Health startHealth() { return lastStartHealth; }
 
     // ============================================================ 状态
 
@@ -589,7 +828,13 @@ public final class VdCtl {
                 + "i=0; while [ $i -lt 40 ]; do grep -q 'LISTEN' /tmp/icrecv.log 2>/dev/null && break; "
                 + "i=$((i+1)); sleep 0.15; done; "
                 + "ps -o pid,args | grep -F \"$PAT\" | grep -v grep | wc -l";
-        return parseInt(lastLine(Icrpc.run(adb, cmd, 8, 45000)));
+        int alive = parseInt(lastLine(Icrpc.run(adb, cmd, 8, 45000)));
+        if (alive > 0) {
+            // 只有真的起来了才要求收尾时看到恢复标记（UX-12 的幂等前提）
+            receiverEverStarted = true;
+            receiverRestored = false;
+        }
+        return alive;
     }
 
     private int stopReceiver() throws IOException {

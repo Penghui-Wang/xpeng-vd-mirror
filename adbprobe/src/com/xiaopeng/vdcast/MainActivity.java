@@ -55,6 +55,18 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
     private EditText pkgEdit;
     private EditText clusterEdit;
     private Button btnStartVd, btnStartMain, btnStop, btnStatus, btnCrop, btnProbe, btnPick, btnFrame, btnCluster, btnPreview;
+    /** 退出入口（UI-08）与日志折叠开关 */
+    private Button btnExit, btnLogToggle;
+    /** 高级设置区标题，本身是个整宽按钮（可点区域要够大） */
+    private Button advHead;
+    /** 三层小灯右侧的「刷新」 */
+    private Button btnHealth;
+    /** 日志行的「诊断」按钮 */
+    private Button btnDiag;
+    /** 中间那块可滚动的正文区（诊断用：触摸失效时要看它到底给了多大视口） */
+    private ScrollView bodySv;
+    /** 主 CTA 下方的「投屏区多大 / 大概能跑多少帧」提示 */
+    private TextView cfgHint;
 
     private Adb adb;
     private VdCtl ctl;
@@ -79,6 +91,7 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         print("仪表投屏 v2.0");
         print("流程：选应用 → 仪表区域 → 裁切画面 → 启动投屏 → 预览");
         setBusy(false);
+        showGuideIfNeeded();
         handleIntent(getIntent());
     }
 
@@ -87,6 +100,24 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         super.onNewIntent(it);
         setIntent(it);
         handleIntent(it);
+    }
+
+    /**
+     * 返回键不能直接结束 Activity。
+     *
+     * 面板开着的时候 VdSend / icrecv 可能还在跑，直接 finish 会留下两个孤儿进程：
+     * 车机继续采屏、仪表继续占着 fb1，用户却看不到任何界面能停它。
+     * 所以返回键统一走「退出应用」那条带收尾的路径。
+     */
+    @Override
+    public void onBackPressed() {
+        if (!advOpen && !logOpen) {
+            confirmExit();
+        } else {
+            // 有展开的区域时，返回键先收起来（符合「返回上一级」的直觉）
+            if (advOpen) setAdvOpen(false);
+            else setLogOpen(false);
+        }
     }
 
     /**
@@ -117,14 +148,13 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
             case "pick":    run(this::pickApp); break;
             case "vd":      run(() -> startWith("vd")); break;
             case "main":    run(() -> startWith("main")); break;
-            case "stop":    run(() -> {
-                if (!ensureCtl()) return;
-                setPhase(Phase.STOPPING);
-                boolean ok = ctl.stop();
-                setPhase(ok ? Phase.CONNECTED : Phase.ERROR, ok ? "" : "停止未完成");
-                previewOpened = false;
-            });
-                break;
+            case "stop":    run(this::stopCasting); break;
+            case "health":  run(this::refreshHealth); break;
+            // 把关键控件的屏幕坐标打到日志：PC 侧 input tap 老是点偏时用来自校准
+            case "coords":  runOnUiThread(this::dumpCoords); break;
+            case "exit":    runOnUiThread(this::confirmExit); break;
+            // 无确认直接退出：给 PC 侧和自动化留的口子（人用的路径必须走 confirmExit）
+            case "exitnow": runOnUiThread(this::runExit); break;
             case "crop":    run(() -> {
                 if (!ensureCtl()) return;
                 ctl.setCrop(cropEdit.getText().toString());
@@ -191,6 +221,25 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
 
     private LinearLayout root;
     private TextView stateChip;
+
+    // ---------- B3 新增的视图 ----------
+    /** 三层小灯：adb / 发送端 / 接收端。旧面板上三者坏掉时长得一模一样，恢复手段却完全不同 */
+    private TextView dotAdb, dotSender, dotRecv;
+    /** 实测帧率（车机侧 / 仪表侧） */
+    private TextView fpsView;
+    private TextView logSummary;
+    private ScrollView logScrollRef;
+    private LinearLayout logCard;
+    /** 高级设置区（端口、模式、连接、状态、自检全部下沉到这里） */
+    private LinearLayout advBody;
+    private boolean advOpen;
+    /** 日志是否展开（默认折叠成一行，出错自动展开） */
+    private boolean logOpen;
+    /** 诊断模式：连点日志标题 5 次打开，打开后日志常驻展开 */
+    private boolean diagMode;
+    private int logTitleTaps;
+    /** 最近一次健康探针结果，供「灯」和「面积提示」共用 */
+    private volatile VdCtl.Health lastHealth;
 
     // ---------- 顶部流程条 ----------
     // 顺序按「先定仪表投屏区、再按它的宽高比框车机画面」排：投屏区决定投出去多大，
@@ -262,33 +311,52 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
 
         String s;
         int c;
+        // 用户级 4 态（UX-08）：未连接 / 就绪 / 投屏中 / 出错了。
+        // 「启动中」「收尾中」是必须让用户看到的过渡态，否则点了没反应像是卡死。
         switch (phase) {
-            case CONNECTED: s = "已连接";   c = C_OK;     break;
+            case CONNECTED: s = "就绪";     c = C_OK;     break;
             case STARTING:  s = "启动中…";  c = C_ACCENT; break;
             case CASTING:
                 if (stale) { s = "投屏中 · 配置已改"; c = C_WARN; }
                 else       { s = "投屏中";            c = C_OK; }
                 break;
-            case STOPPING:  s = "停止中…";  c = C_ACCENT; break;
-            case ERROR:     s = "失败";     c = C_DANGER; break;
-            default:        s = "待机";     c = C_MUTED;  break;
+            case STOPPING:  s = "收尾中…";  c = C_ACCENT; break;
+            case ERROR:     s = "出错了";   c = C_DANGER; break;
+            default:        s = "未连接";   c = C_MUTED;  break;
         }
         stateChip.setText(s);
         stateChip.setTextColor(c);
         stateChip.setBackground(round(0x22000000 | (c & 0xFFFFFF), 0, dp(20)));
 
+        // 主 CTA：一个按钮，文案直接说清「现在点它会干什么」（UI-04）
+        if (btnStartVd != null) {
+            String go;
+            if (busy || phase == Phase.STARTING) go = "正在启动…";
+            else if (phase == Phase.STOPPING) go = "正在收尾…";
+            else if (stale) go = "应用新配置";
+            else if (fresh) go = "投屏中";
+            else go = "启动投屏";
+            btnStartVd.setText(go);
+            btnStartVd.setEnabled(hasPkg && !busy && !fresh
+                    && phase != Phase.STARTING && phase != Phase.STOPPING);
+            btnStartVd.setBackground(round(fresh ? 0xFF14301F : C_ACCENT,
+                    fresh ? C_OK : C_ACCENT, dp(9)));
+        }
+        if (cfgHint != null) cfgHint.setText(areaHint());
+
         // 按钮：只按「有没有可能成功」禁用，不按状态机猜到的运行态禁用 ——
         // 状态机可能落后于车机（比如车机重启了），「停止」永远留一条手动兜底的路。
-        btnStartVd.setEnabled(hasPkg && !busy);
-        btnStartMain.setEnabled(hasPkg && !busy);
-        btnStop.setEnabled(!busy);
-        btnStatus.setEnabled(!busy);
-        btnCrop.setEnabled(!busy);
-        btnProbe.setEnabled(!busy);
-        btnPick.setEnabled(!busy);
-        btnFrame.setEnabled(!busy);
-        btnCluster.setEnabled(!busy);
-        btnPreview.setEnabled(!busy);
+        // 主 CTA 的可用性已经在上面按 phase 单独算过了，这里不再覆盖。
+        if (btnStartMain != null) btnStartMain.setEnabled(hasPkg && !busy);
+        if (btnStop != null) btnStop.setEnabled(!busy);
+        if (btnStatus != null) btnStatus.setEnabled(!busy);
+        if (btnCrop != null) btnCrop.setEnabled(!busy);
+        if (btnProbe != null) btnProbe.setEnabled(!busy);
+        if (btnPick != null) btnPick.setEnabled(!busy);
+        if (btnFrame != null) btnFrame.setEnabled(!busy);
+        if (btnCluster != null) btnCluster.setEnabled(!busy);
+        if (btnPreview != null) btnPreview.setEnabled(!busy);
+        if (btnExit != null) btnExit.setEnabled(!busy);
     }
 
     private void paintSteps(int cur) {
@@ -319,22 +387,54 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(C_BG);
-        root.setPadding(dp(14), dp(6), dp(14), dp(6));
+        // 顶部留出系统状态栏的高度：面板是铺到屏幕右缘的窗口，状态栏（铃铛/电量/时间）
+        // 会盖在右上角 —— 顶栏的「退出」按钮原来正好被它吃掉，看得见才怪。
+        root.setPadding(dp(14), dp(30), dp(14), dp(6));
 
-        // ---------- 顶栏：标题 + 状态 ----------
-        // 状态胶囊紧贴标题，不再用 spacer 推到最右：面板窗口铺到屏幕右缘，
-        // 最右侧是系统状态栏（铃铛/电量/时间），推过去就被压住看不见了。
+        // ---------- 顶栏：标题 + 状态 + 退出 ----------
+        // 状态胶囊紧贴标题（右侧是系统状态栏，推过去会被压住）；退出固定在右上角。
+        // 点胶囊 = 展开工程级详情（UX-08：普通人看 4 态，工程师一键看原始 status）。
         LinearLayout head = row();
         TextView title = text("仪表投屏", 34, C_TEXT);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         head.addView(title);
-        stateChip = chip("待机", C_MUTED);
+        stateChip = chip("未连接", C_MUTED);
         LinearLayout.LayoutParams chipLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         chipLp.leftMargin = dp(10);
         head.addView(stateChip, chipLp);
         head.addView(spacer());
+        btnExit = mkDanger("退出");
+        btnExit.setPadding(dp(18), dp(5), dp(18), dp(5));
+        head.addView(btnExit);
+        stateChip.setOnClickListener(v -> run(this::showStatus));
         root.addView(head);
+
+        // ---------- 三层小灯 ----------
+        // 「adb 掉线 / 发送端崩了 / 接收端没起」在旧面板上长得一模一样（都显示投屏中），
+        // 恢复手段却完全不同 —— 拆成三个独立灯 + 实测帧率。
+        LinearLayout lamps = row();
+        lamps.setPadding(0, dp(2), 0, dp(2));
+        dotAdb = dot(C_MUTED);
+        dotSender = dot(C_MUTED);
+        dotRecv = dot(C_MUTED);
+        lamps.addView(dotAdb);
+        lamps.addView(lampLabel("ADB"));
+        lamps.addView(dotSender);
+        lamps.addView(lampLabel("发送端"));
+        lamps.addView(dotRecv);
+        lamps.addView(lampLabel("接收端"));
+        fpsView = text("车机 -- · 仪表 --", 20, C_MUTED);
+        LinearLayout.LayoutParams fpsLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        fpsLp.leftMargin = dp(12);
+        lamps.addView(fpsView, fpsLp);
+        lamps.addView(spacer());
+        Button btnHealthLocal = mkButton("刷新");
+        btnHealth = btnHealthLocal;
+        btnHealthLocal.setOnClickListener(v -> run(this::refreshHealth));
+        lamps.addView(btnHealthLocal);
+        root.addView(lamps);
 
         // ---------- 流程条（常驻，不随日志滚走） ----------
         HorizontalScrollView hs = new HorizontalScrollView(this);
@@ -361,18 +461,18 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         LinearLayout body = new LinearLayout(this);
         body.setOrientation(LinearLayout.VERTICAL);
 
-        // ---------- 目标应用 ----------
+        // ---------- 卡片 1：目标应用 ----------
         LinearLayout c1 = card();
-        c1.addView(label("目标应用（搬到虚拟屏的第三方应用）"));
+        c1.addView(label("目标应用（要搬到虚拟屏的第三方应用）"));
         LinearLayout r1 = row();
         pkgEdit = input("com.tencent.qqmusicpad");
         r1.addView(pkgEdit, weight());
-        btnPick = mkButton("选择");
+        btnPick = mkButton("更换");
         r1.addView(btnPick);
         c1.addView(r1);
         body.addView(c1);
 
-        // ---------- 区域 ----------
+        // ---------- 卡片 2：区域 ----------
         // 顺序有意：先定「投到仪表哪里」，再框「车机取哪块」。
         // 裁切框选按投屏区的宽高比锁比例，反过来排会先裁一次再返工（UX-02）。
         LinearLayout c2 = card();
@@ -395,35 +495,84 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         c2.addView(r2);
         body.addView(c2);
 
-        // ---------- 操作 ----------
+        // ---------- 卡片 3：主 CTA ----------
+        // 整个面板只有这一个「必须点对」的按钮：全宽、加高、文案随状态变。
         LinearLayout c3 = card();
-        c3.addView(label("投屏控制"));
         LinearLayout r4 = row();
-        btnStartVd = mkPrimary("启动 vd");
-        btnStartMain = mkButton("启动 main");
+        btnStartVd = mkPrimary("启动投屏");
+        LinearLayout.LayoutParams goLp = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        goLp.rightMargin = dp(8);
+        btnStartVd.setLayoutParams(goLp);
+        btnStartVd.setTextSize(TypedValue.COMPLEX_UNIT_PX, 32);
+        btnStartVd.setPadding(dp(14), dp(11), dp(14), dp(11));
         btnStop = mkDanger("停止");
+        btnStop.setTextSize(TypedValue.COMPLEX_UNIT_PX, 30);
+        btnStop.setPadding(dp(20), dp(11), dp(20), dp(11));
         r4.addView(btnStartVd);
-        r4.addView(btnStartMain);
         r4.addView(btnStop);
         c3.addView(r4);
 
+        // 面积提示（60 帧口径按 A：承认物理上限，把话说清楚，不拦用户选大区域）
+        cfgHint = text("", 20, C_MUTED);
+        cfgHint.setPadding(0, dp(5), 0, 0);
+        c3.addView(cfgHint);
+
         LinearLayout r5 = row();
-        r5.setPadding(0, dp(2), dp(40), 0);
-        final Button btnConnect = mkButton("连接");
-        btnPreview = mkButton("预览");
-        btnStatus = mkButton("状态");
-        btnProbe = mkButton("自检");
+        r5.setPadding(0, dp(4), 0, 0);
+        btnPreview = mkButton("预览画面");
         r5.addView(btnPreview);
-        r5.addView(btnStatus);
-        r5.addView(btnProbe);
-        r5.addView(btnConnect);
-        portEdit = input("5050");
-        r5.addView(portEdit, new LinearLayout.LayoutParams(dp(56),
-                ViewGroup.LayoutParams.WRAP_CONTENT));
+        r5.addView(spacer());
         c3.addView(r5);
         body.addView(c3);
 
+        // ---------- 卡片 4：高级（默认折叠） ----------
+        LinearLayout c4 = card();
+        // 用整宽按钮而不是可点文字：这台车机上面板是一个独立窗口，实测 22px 高的
+        // TextView 点击区域收不到 tap（同样的位置换成 Button 就正常），
+        // 与其赌，不如直接给一个 60px 高的按钮。
+        advHead = btn("高级设置  ▸", 0xFF1B2330, C_MUTED);
+        advHead.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams ahLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        ahLp.topMargin = dp(2);
+        advHead.setLayoutParams(ahLp);
+        advHead.setOnClickListener(v -> setAdvOpen(!advOpen));
+        c4.addView(advHead);
+
+        advBody = new LinearLayout(this);
+        advBody.setOrientation(LinearLayout.VERTICAL);
+        advBody.setVisibility(View.GONE);
+
+        advBody.addView(label("启动模式（main = 抓整块主屏，调试用）"));
+        LinearLayout mrow = row();
+        Button btnStartVdAdv = mkButton("按 vd 启动");
+        btnStartMain = mkButton("按 main 启动");
+        btnStartVdAdv.setOnClickListener(v -> run(() -> startWith("vd")));
+        btnStartMain.setOnClickListener(v -> run(() -> startWith("main")));
+        mrow.addView(btnStartVdAdv);
+        mrow.addView(btnStartMain);
+        advBody.addView(mrow);
+
+        advBody.addView(label("连接与诊断"));
+        LinearLayout r6 = row();
+        r6.setPadding(0, dp(2), dp(30), 0);
+        final Button btnConnect = mkButton("连接");
+        btnStatus = mkButton("状态");
+        btnProbe = mkButton("自检");
+        portEdit = input("5050");
+        r6.addView(btnConnect);
+        r6.addView(portEdit, new LinearLayout.LayoutParams(dp(56),
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+        r6.addView(btnStatus);
+        r6.addView(btnProbe);
+        advBody.addView(r6);
+
+        c4.addView(advBody);
+        body.addView(c4);
+
         ScrollView sv = new ScrollView(this);
+        bodySv = sv;
         sv.setVerticalScrollBarEnabled(false);
         // fillViewport + 显式 MATCH_PARENT：不这么写 ScrollView 会按「无宽度约束」测量子视图，
         // 行内 weight 的输入框会把右边的按钮挤出卡片（第一版就被挤掉半个「框选」）。
@@ -433,22 +582,43 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         root.addView(sv, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        // ---------- 日志 ----------
-        LinearLayout c4 = card();
-        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(122));
-        clp.topMargin = dp(8);
-        c4.setLayoutParams(clp);
+        // ---------- 日志（默认折叠一行，出错自动展开） ----------
+        // 旧面板固定 122dp 给日志，普通用户看不懂还占掉半屏；折叠后只剩一行摘要，
+        // 出错时自动展开（UI-11）。连点标题 5 次进诊断模式，日志常驻展开。
+        logCard = card();
         LinearLayout lh = row();
-        lh.addView(label("运行日志"));
-        lh.addView(spacer());
+        // 右侧留出车机悬浮球的位置：它固定在屏幕右下角，会把「展开 / 清屏」盖住
+        lh.setPadding(0, 0, dp(110), 0);
+        // 整行可点（连点 5 次进诊断模式）：只让 22px 的「运行日志」四个字可点，
+        // 在车机上基本等于点不到
+        lh.setOnClickListener(v -> onLogTitleTap());
+        TextView logTitle = text("运行日志", 22, C_MUTED);
+        logTitle.setOnClickListener(v -> onLogTitleTap());
+        lh.addView(logTitle);
+        logSummary = text("", 20, 0xFF5B6673);
+        logSummary.setSingleLine(true);
+        logSummary.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        LinearLayout.LayoutParams sumLp = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        sumLp.leftMargin = dp(8);
+        lh.addView(logSummary, sumLp);
+        btnLogToggle = mkButton("展开");
+        btnLogToggle.setOnClickListener(v -> setLogOpen(!logOpen));
+        lh.addView(btnLogToggle);
+        // 诊断模式入口做成按钮：这台车机上面板是独立窗口，实测只有 Button 能稳定
+        // 收到点击（TextView / 整行的 onClickListener 收不到 tap），
+        // 所以「连点标题 5 次」那个隐藏入口保留，但给一个能点到的显式按钮。
+        btnDiag = mkButton("诊断");
+        btnDiag.setOnClickListener(v -> enableDiag());
+        lh.addView(btnDiag);
         Button clear = mkButton("清屏");
         clear.setOnClickListener(v -> {
             logBuf.setLength(0);
             if (logView != null) logView.setText("");
+            if (logSummary != null) logSummary.setText("");
         });
         lh.addView(clear);
-        c4.addView(lh);
+        logCard.addView(lh);
 
         logScroll = new ScrollView(this);
         logView = new TextView(this);
@@ -459,9 +629,10 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         logView.setPadding(dp(8), dp(6), dp(8), dp(6));
         logView.setMovementMethod(new ScrollingMovementMethod());
         logScroll.addView(logView);
-        c4.addView(logScroll, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
-        root.addView(c4);
+        logScroll.setVisibility(View.GONE);
+        logCard.addView(logScroll, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(96)));
+        root.addView(logCard);
 
         // ---------- 事件 ----------
         // 手改参数也要立刻反映到流程条：改了应用/矩形/裁切而没重新启动，
@@ -484,24 +655,13 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
             if (ensureConn()) print("已连接 " + adb.endpoint);
         }));
 
-        btnStartVd.setOnClickListener(v -> run(() -> startWith("vd")));
-        btnStartMain.setOnClickListener(v -> run(() -> startWith("main")));
+        // 主 CTA 按「上次用的模式」启动（默认 vd）；main 只从高级里显式触发。
+        // 拿到 CTA 就是一条正常路径，不需要用户理解 vd / main 是什么（UI-04）。
+        btnStartVd.setOnClickListener(v -> run(() -> startWith(lastMode)));
 
-        btnStop.setOnClickListener(v -> run(() -> {
-            // 状态机可能落后于车机（车机重启 / 掉线后语义就错了），所以「停止」
-            // 永远可点：没在投也让它真去收一遍尾，而不是靠界面判断直接跳过。
-            if (phase != Phase.CASTING) print("当前面板认为没有在投屏，照样执行一遍收尾");
-            if (!ensureCtl()) return;
-            setPhase(Phase.STOPPING);
-            boolean ok = ctl.stop();
-            previewOpened = false;
-            setPhase(ok ? Phase.CONNECTED : Phase.ERROR, ok ? "" : "停止未完成");
-        }));
+        btnStop.setOnClickListener(v -> run(this::stopCasting));
 
-        btnStatus.setOnClickListener(v -> run(() -> {
-            if (!ensureCtl()) return;
-            print(ctl.status());
-        }));
+        btnStatus.setOnClickListener(v -> run(this::showStatus));
 
         btnProbe.setOnClickListener(v -> run(this::probe));
 
@@ -516,8 +676,345 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         btnFrame.setOnClickListener(v -> run(this::frameCrop));
         btnCluster.setOnClickListener(v -> run(this::pickClusterArea));
         btnPreview.setOnClickListener(v -> openPreview());
+        btnExit.setOnClickListener(v -> confirmExit());
 
         return root;
+    }
+
+    // ------------------------------------------------------------ B3 新增的交互
+
+    /** 停止投屏：状态机可能落后于车机，所以永远真去收一遍尾 */
+    private void stopCasting() {
+        if (phase != Phase.CASTING) print("当前面板认为没有在投屏，照样执行一遍收尾");
+        if (!ensureCtl()) return;
+        setPhase(Phase.STOPPING);
+        boolean ok = ctl.stop();
+        previewOpened = false;
+        setPhase(ok ? Phase.CONNECTED : Phase.ERROR, ok ? "" : "仪表未确认恢复");
+        refreshHealth();
+    }
+
+    /**
+     * 退出应用（UX-05）。
+     *
+     * 不许静默退出：必须先停投屏、等两端进程真的结束、清掉临时文件，再关 socket 退出。
+     * 总预算 8s；超时也要说清是哪一步没走完，并把选择权交回用户（再等 / 强制退出）。
+     */
+    private void confirmExit() {
+        if (busy) {
+            print("（上一条任务还在跑，等它结束再退出）");
+            return;
+        }
+        boolean casting = phase == Phase.CASTING || phase == Phase.STARTING || phase == Phase.STOPPING;
+        AlertDialog dlg = new AlertDialog.Builder(this)
+                .setTitle("退出应用")
+                .setMessage(casting
+                        ? "会先停止投屏、等车机与仪表两端进程结束，再退出。\n预计 6~8 秒。"
+                        : "没有在投屏，只清理临时文件后退出。")
+                .setNegativeButton("取消", null)
+                .setPositiveButton("退出", (d, w) -> runExit())
+                .show();
+        // 默认不 focus 的 positive 按钮在「没有触屏 / 用旋钮」的场景里选不中，
+        // 这里主动给焦点，回车即退出
+        try {
+            dlg.getButton(AlertDialog.BUTTON_POSITIVE).requestFocus();
+        } catch (Throwable ignored) { }
+    }
+
+    private void runExit() {
+        if (busy) {
+            print("（上一条任务还在跑，等它结束再退出）");
+            return;
+        }
+        print("开始退出：先收尾，再关连接");
+        setBusy(true);
+        worker.execute(() -> {
+            final long t0 = System.currentTimeMillis();
+            final long deadline = t0 + 8000;
+            boolean carOk = true;
+            boolean restored = true;
+            int residual = -1;
+            try {
+                // 1) 停投屏。只要连过 adb 就真去收一遍（状态机可能已经落后）
+                if (ctl != null || adb.isConnected()) {
+                    if (!ensureConn()) {
+                        carOk = false;
+                        print("!! 退出时连不上 adbd，无法确认两端进程状态");
+                    } else if (ctl == null) {
+                        print("本次没启动过投屏，跳过收尾");
+                    } else {
+                        setPhase(Phase.STOPPING);
+                        boolean ok = ctl.stop(deadline);
+                        carOk = ok;
+                        restored = ctl.isRestored();
+                    }
+                } else {
+                    print("本次没连过 adb，跳过收尾");
+                }
+                // 2) 清临时文件（不删已投送产物：删了下次要多等 10~30s 重推）
+                if (adb.isConnected() && ctl != null) {
+                    residual = ctl.cleanupTemp();
+                    print("临时文件清理：" + (residual == 0 ? "干净" : "残留 " + residual));
+                }
+                // 3) 本地缓存里的裁切底图
+                File shot = new File(getCacheDir(), "crop.png");
+                if (shot.exists() && !shot.delete()) print("（本地缓存 crop.png 没删掉，无害）");
+            } catch (Throwable t) {
+                print("!! 退出收尾异常: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+                carOk = false;
+            } finally {
+                final long cost = System.currentTimeMillis() - t0;
+                final boolean fCarOk = carOk;
+                final boolean fRestored = restored;
+                final boolean ok = fCarOk && fRestored;
+                print("退出用时 " + cost + " ms" + (ok ? "" : "（未完全收尾）"));
+                try {
+                    adb.close();
+                } catch (Throwable ignored) { }
+                final boolean needAsk = !ok;
+                runOnUiThread(() -> {
+                    setBusy(false);
+                    if (!needAsk) {
+                        finishAffinity();
+                        // 彻底退出：Activity 关掉之后进程默认还留着（下次变温启动）。
+                        // 「退出应用」在用户心智里就是彻底退出，所以连进程一起收掉；
+                        // 留 500ms 让 SharedPreferences 与日志落盘。
+                        new android.os.Handler(getMainLooper()).postDelayed(
+                                () -> android.os.Process.killProcess(android.os.Process.myPid()), 500);
+                    } else {
+                        // 不能把用户困在这里，但也不能假装干净：说清楚哪里没停，让他选
+                        new AlertDialog.Builder(this)
+                                .setTitle("收尾未完成")
+                                .setMessage("仍有环节未确认：\n" + exitProblem(fCarOk, fRestored)
+                                        + "\n\n继续退出可能让仪表停在投屏画面上；"
+                                        + "建议点「再收一次」等它结束。")
+                                .setNegativeButton("强制退出", (d, w) -> finishAffinity())
+                                .setPositiveButton("再收一次", (d, w) -> runExit())
+                                .show();
+                    }
+                });
+            }
+        });
+    }
+
+    /**
+     * 只说真的没确认的那一项。
+     *
+     * carOk 是 stop() 的总返回值（含仪表恢复），所以不能拿它单独判「进程没退」——
+     * 否则仪表没恢复时会出现「进程未确认退出」的误报，把用户往错的方向引。
+     */
+    private String exitProblem(boolean carOk, boolean restored) {
+        StringBuilder sb = new StringBuilder();
+        if (!restored) sb.append("· 仪表未确认恢复原版面\n");
+        else if (!carOk) sb.append("· 车机发送端 / 仪表端进程未确认退出\n");
+        if (sb.length() == 0) sb.append("· 未取到确认信息\n");
+        return sb.toString();
+    }
+
+    /** 三层小灯探一轮（一次 exec + 一次 RPC，约 2 秒） */
+    private void refreshHealth() {
+        if (!ensureConn()) return;
+        VdCtl.Health h = ctl != null ? ctl.health() : null;
+        if (h == null) {
+            // ctl 还没建（没启动过投屏），建一个只为探测；不启动任何东西
+            ensureCtl();
+            h = ctl != null ? ctl.health() : null;
+        }
+        if (h == null) return;
+        lastHealth = h;
+        final VdCtl.Health hh = h;
+        runOnUiThread(() -> paintHealth(hh));
+        print("灯：ADB " + (h.adbOk ? "通" : "断")
+                + " / 发送端 " + h.sender + " / 接收端 " + h.receiver
+                + " / 车机 " + h.carsFpsText() + "fps / 仪表 " + h.icFpsText() + "fps"
+                + "（" + h.costMs + "ms）");
+        if (!h.adbOk) {
+            print("!! adb 通道断了：车机重启 / 无线调试被关 / 端口变了");
+            // 状态机别再说「投屏中」：灯红了、胶囊还绿着，用户会以为画面只是卡了一下
+            setPhase(Phase.ERROR, "adb 断线");
+        } else if (phase == Phase.CASTING && h.sender == 0) {
+            print("!! 发送端不在了但面板还认为在投屏（B1 取消的代价）：按「停止」收尾后重来");
+            setPhase(Phase.ERROR, "发送端已退出");
+        } else if (phase == Phase.CASTING && h.receiver == 0) {
+            print("!! 仪表接收端不在了：仪表可能重启过，按「停止」收尾后重来");
+            setPhase(Phase.ERROR, "仪表接收端未运行");
+        }
+    }
+
+    /** 按健康度给三盏灯上色 */
+    private void paintHealth(VdCtl.Health h) {
+        if (dotAdb == null) return;
+        setDot(dotAdb, h.adbOk ? C_OK : C_DANGER);
+        // 发送端/接收端：有进程=绿；没进程时，如果是「投屏中」就是红的（死了），
+        // 否则是灰的（本来就没跑，不是故障）—— 这样才分得清「坏了」和「没开」
+        boolean casting = phase == Phase.CASTING || phase == Phase.STARTING;
+        paintProcLamp(dotSender, h.sender, casting);
+        paintProcLamp(dotRecv, h.receiver, casting);
+        if (fpsView != null) {
+            fpsView.setText("车机 " + h.carsFpsText() + " · 仪表 " + h.icFpsText() + " fps");
+            fpsView.setTextColor(h.adbOk ? C_MUTED : C_DANGER);
+        }
+    }
+
+    private void paintProcLamp(TextView d, int n, boolean casting) {
+        if (n < 0) setDot(d, C_MUTED);
+        else if (n > 0) setDot(d, C_OK);
+        else setDot(d, casting ? C_DANGER : C_MUTED);
+    }
+
+    private void setDot(TextView d, int color) {
+        if (d == null) return;
+        android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+        g.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+        g.setColor(color);
+        d.setBackground(g);
+    }
+
+    private TextView dot(int color) {
+        TextView t = new TextView(this);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(10), dp(10));
+        t.setLayoutParams(lp);
+        setDot(t, color);
+        return t;
+    }
+
+    private TextView lampLabel(String s) {
+        TextView t = text(s, 20, C_MUTED);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.leftMargin = dp(4);
+        lp.rightMargin = dp(10);
+        t.setLayoutParams(lp);
+        return t;
+    }
+
+    /** 工程级详情（UX-08）：点状态胶囊或高级里的「状态」 */
+    private void showStatus() {
+        // 展开是 UI 动作、取状态是网络动作，这里分两头：先展开（用户能立刻看到反应），
+        // 再在 worker 线程里跑 status()（它要跑十几次 adb + 一次仪表 RPC）
+        runOnUiThread(() -> {
+            setAdvOpen(true);
+            setLogOpen(true);
+        });
+        if (!ensureCtl()) return;
+        print(ctl.status());
+    }
+
+    private void setAdvOpen(boolean open) {
+        advOpen = open;
+        if (advBody != null) advBody.setVisibility(open ? View.VISIBLE : View.GONE);
+        if (advHead != null) advHead.setText(open ? "高级设置  ▾" : "高级设置  ▸");
+        if (open && bodySv != null) {
+            // 展开后内容会超过可视区，不滚一下用户只能看到「启动模式」这一行标题
+            bodySv.post(() -> bodySv.fullScroll(View.FOCUS_DOWN));
+        }
+    }
+
+    /**
+     * 把关键控件的屏幕坐标打到日志。
+     *
+     * 为什么需要：面板是 freeform 窗口（mFrame=[960,0][2400,1080]），
+     * 截图是 2400×1200 但窗口只到 1080，PC 侧用 input tap 反复点偏。
+     * 有这一行就能一次算准，不用再猜。
+     */
+    private void dumpCoords() {
+        int[] xy = new int[2];
+        if (bodySv != null) {
+            bodySv.getLocationOnScreen(xy);
+            print("  滚动区: " + xy[0] + "," + xy[1] + "  " + bodySv.getWidth() + "x"
+                    + bodySv.getHeight() + "  scrollY=" + bodySv.getScrollY());
+        }
+        for (View v : new View[]{btnStartVd, btnStop, btnPreview, advHead, btnLogToggle, btnDiag,
+                btnExit, btnHealth, stateChip, pkgEdit, clusterEdit}) {
+            if (v == null) continue;
+            v.getLocationOnScreen(xy);
+            print("  坐标 " + tagOf(v) + ": " + xy[0] + "," + xy[1]
+                    + "  " + v.getWidth() + "x" + v.getHeight()
+                    + "  clickable=" + v.isClickable() + " enabled=" + v.isEnabled()
+                    + " vis=" + (v.getVisibility() == View.VISIBLE ? "V" : "H"));
+        }
+    }
+
+    private static String tagOf(View v) {
+        if (v instanceof Button) {
+            CharSequence t = ((Button) v).getText();
+            return "[" + (t == null ? "" : t.toString().replace("  ", " ")) + "]";
+        }
+        if (v instanceof TextView) {
+            CharSequence t = ((TextView) v).getText();
+            String s = t == null ? "" : t.toString();
+            return "[" + (s.length() > 10 ? s.substring(0, 10) + "…" : s) + "]";
+        }
+        return "[" + v.getClass().getSimpleName() + "]";
+    }
+
+    private void setLogOpen(boolean open) {
+        logOpen = open;
+        if (logScroll != null) logScroll.setVisibility(open ? View.VISIBLE : View.GONE);
+        if (btnLogToggle != null) btnLogToggle.setText(open ? "收起" : "展开");
+    }
+
+    /**
+     * 连点日志标题 5 次进诊断模式（UI-11）。
+     * 诊断模式的意义：让现场能自己把日志留住，不用连电脑。
+     */
+    private void onLogTitleTap() {
+        logTitleTaps++;
+        if (logTitleTaps >= 5 && !diagMode) {
+            enableDiag();
+            return;
+        }
+        // 没到 5 次就按普通点击处理：切换展开/收起
+        if (!diagMode) setLogOpen(!logOpen);
+    }
+
+    /** 诊断模式：日志常驻展开 + 状态胶囊点了直接出工程详情 */
+    private void enableDiag() {
+        if (diagMode) {
+            setLogOpen(!logOpen);
+            return;
+        }
+        diagMode = true;
+        setLogOpen(true);
+        if (btnDiag != null) btnDiag.setText("诊断中");
+        print("诊断模式已开启：日志常驻展开；点顶部状态胶囊可看工程详情（原始 status）");
+    }
+
+    /** 投屏区一行提示：面积 + 预期帧率（60 帧口径按 A） */
+    private String areaHint() {
+        int[] r = rect(txt(clusterEdit));
+        if (r == null) return "投屏区域格式应为 x,y,w,h";
+        boolean band = r[0] == 0 && r[1] == 72 && r[2] == 1920 && r[3] == 568;
+        return "投屏区 " + r[2] + "×" + r[3] + (band ? "（满宽横带）" : "（自定义）")
+                + " · " + VdCtl.fpsHint(r[2], r[3]);
+    }
+
+    /** 解析 x,y,w,h；格式不对返回 null */
+    private static int[] rect(String s) {
+        if (s == null) return null;
+        String[] p = s.trim().split(",");
+        if (p.length != 4) return null;
+        try {
+            int[] r = new int[4];
+            for (int i = 0; i < 4; i++) r[i] = Integer.parseInt(p[i].trim());
+            return r[2] > 0 && r[3] > 0 ? r : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 首启引导（UX-09）：三条硬前提，只说一次 */
+    private void showGuideIfNeeded() {
+        SharedPreferences sp = getPreferences(MODE_PRIVATE);
+        if (sp.getBoolean("guideV1", false)) return;
+        sp.edit().putBoolean("guideV1", true).apply();
+        new AlertDialog.Builder(this)
+                .setTitle("使用前请确认三件事")
+                .setMessage("1. 车机首次连接会弹「允许 USB 调试」，请勾选「一律允许」再确定。\n\n"
+                        + "2. 仪表必须通电开机，否则只能投到车机自己的屏幕上。\n\n"
+                        + "3. 请在驻车状态下操作：行车中系统可能拦截投屏。")
+                .setPositiveButton("知道了", null)
+                .show();
     }
 
     // ------------------------------------------------------------ UI 小工具
@@ -858,6 +1355,53 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
             launchedKey = "";
             setPhase(Phase.ERROR, "启动失败");
         }
+        // 启动流程顺手采到的健康数据（零额外成本），直接点亮三层小灯
+        VdCtl.Health h = ctl.startHealth();
+        if (h != null) {
+            lastHealth = h;
+            runOnUiThread(() -> paintHealth(h));
+        }
+        if (ok) nudgeCarFps();
+    }
+
+    /**
+     * 启动后补一次车机帧率。
+     *
+     * VdSend 是每 2 秒才打第一行 `fps=`，启动流程跑到 [7/8] 时经常还没输出，
+     * 于是灯全绿但「车机 --」。这里单独起个线程等 3 秒再取一次 ——
+     * 不走 worker（会占住后续操作），也不影响启动耗时。
+     */
+    private void nudgeCarFps() {
+        final Adb a = adb;
+        Thread t = new Thread(() -> {
+            try {
+                Thread.sleep(3000);
+                if (!a.isConnected()) return;
+                String out = a.exec("grep 'fps=' /data/local/tmp/vdsend.log 2>/dev/null | tail -1", 12000);
+                final double fps = numOf(out, "fps=(\\d+(?:\\.\\d+)?)");
+                if (fps < 0) return;
+                VdCtl.Health h = lastHealth;
+                if (h == null) return;
+                h.carFps = fps;
+                runOnUiThread(() -> {
+                    if (fpsView != null) {
+                        fpsView.setText("车机 " + h.carsFpsText()
+                                + " · 仪表 " + h.icFpsText() + " fps");
+                    }
+                });
+            } catch (Throwable ignored) { }
+        }, "fps-nudge");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** 从文本里按正则取第一个数字；取不到 -1 */
+    private static double numOf(String s, String regex) {
+        try {
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile(regex).matcher(s);
+            if (m.find()) return Double.parseDouble(m.group(1));
+        } catch (Throwable ignored) { }
+        return -1;
     }
 
     private int dp(int v) {
@@ -891,9 +1435,15 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         refreshUi();
     }
 
-    /** 连上了：只在「还没进入链路」时把 phase 拨到 CONNECTED，别覆盖 CASTING/STARTING */
+    /**
+     * 连上了：只在「还没进入链路」时把 phase 拨到 CONNECTED，别覆盖 CASTING/STARTING。
+     *
+     * 也不覆盖 ERROR —— 这条踩过：stop 报「仪表未确认恢复」把 phase 设成 ERROR，
+     * 紧接着 refreshHealth 里的 ensureConn() 顺手调到这里，把 ERROR 又抹回「就绪」，
+     * 结果日志红字、胶囊绿色。错误态是给用户看的结果，不能被一次心跳探测悄悄消掉。
+     */
     private void markConnected() {
-        if (phase == Phase.IDLE || phase == Phase.ERROR) setPhase(Phase.CONNECTED);
+        if (phase == Phase.IDLE) setPhase(Phase.CONNECTED);
     }
 
     private boolean ensureConn() {
@@ -923,7 +1473,8 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
 
             print("连接 127.0.0.1:" + port + " …");
             if (adb.connect("127.0.0.1", port, 90)) {
-                markConnected();
+                // 这里是真的新建了一条连接，从任何状态都该回到「就绪」
+                setPhase(Phase.CONNECTED);
                 return true;
             }
 
@@ -931,7 +1482,7 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
             for (String ip : localIpv4()) {
                 print("连接 " + ip + ":" + port + " …");
                 if (adb.connect(ip, port, 90)) {
-                    markConnected();
+                    setPhase(Phase.CONNECTED);
                     return true;
                 }
             }
@@ -1050,15 +1601,30 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
 
     @Override
     public void print(String s) {
-        String line = "[" + ts.format(new Date()) + "] " + s;
+        final String line = "[" + ts.format(new Date()) + "] " + s;
         // 同步一份到 logcat，方便 PC 侧 adb logcat -s ADBPROBE:I 回读（车机屏不方便滚动时用）
         android.util.Log.i("ADBPROBE", line);
         logBuf.append(line).append('\n');
         if (logBuf.length() > 200_000) logBuf.delete(0, 100_000);
+        final boolean err = s.contains("!!");
+        final String brief = briefLine(s);
         runOnUiThread(() -> {
+            if (logView == null) return;
             logView.setText(logBuf.toString());
-            logScroll.post(() -> logScroll.fullScroll(View.FOCUS_DOWN));
+            if (logScroll != null) logScroll.post(() -> logScroll.fullScroll(View.FOCUS_DOWN));
+            if (logSummary != null) {
+                logSummary.setText(brief);
+                logSummary.setTextColor(err ? C_DANGER : 0xFF5B6673);
+            }
+            // 出错自动展开：折叠着看不见错误等于没提示（UI-11）
+            if (err && !logOpen && !diagMode) setLogOpen(true);
         });
+    }
+
+    /** 日志折叠时那一行摘要：去掉 `!!` 前缀并截断 */
+    private static String briefLine(String s) {
+        String t = s.replace("!!", "").trim().replace("\n", " ");
+        return t.length() > 30 ? t.substring(0, 30) + "…" : t;
     }
 
     // ------------------------------------------------------------ 杂项

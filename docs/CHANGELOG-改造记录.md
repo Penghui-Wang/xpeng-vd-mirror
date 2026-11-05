@@ -3,6 +3,143 @@
 > 与 `docs/审计-四类改造-答复与需求确认-v1.md` 的批次一一对应。
 > 每条记录「改了什么 / 怎么验的 / 还有什么没做」，便于回滚与交接。
 
+## B3 主面板与退出（2026-11-05 15:50）
+
+> 本批是**面板可用性**的收口：把界面从上到下重排成「一屏一条主路径」，并给「退出」补上真正的收尾链路 —— 之前返回键直接 `finish()`，会留两个孤儿进程。安全相关，全部在驻车、未导航条件下验。
+
+### 改了什么
+
+| 文件 | 变更 |
+|---|---|
+| `MainActivity.java` | 见下 6 组（UI-04/06/08/10/11、UX-05/08/09/12） |
+| `VdCtl.java` | ① 新增 `Health` 内部类 + `health()`：**一次 exec + 一次 Icrpc** 拿齐 adb / 发送端 / 接收端 / 两侧 fps / 虚拟屏数；② 新增 `startHealth()`，让 `start()` 顺手回一份零成本快照（启动后立刻有小灯，不用再等 336ms 探测）；③ 新增 `cleanupTemp()` 清 `/data/local/tmp/vdcap|_vdcrop.png|.adbprobe_*`（**不删** `vd.dex` 与 `/tmp/icrecv_dbg`，删了要重投 10–30s）；④ `stop(long deadlineAt)` 改为带截止时间，四步各自可判超时 |
+
+**① UI-06 / UI-04：整屏重排 + 单一主 CTA**
+
+从上到下：顶栏（标题 + 状态胶囊 + 右「退出」）→ 三层小灯行 + fps +「刷新」→ 流程条 → 卡片1 目标应用 → 卡片2 仪表区域 → 卡片3 主 CTA（全宽「启动投屏」+ 停止 + 面积提示 + 预览）→ 卡片4 高级（整宽 Button 标题，内含 `按 vd 启动` / `按 main 启动` / 连接 / 端口 / 状态 / 自检）→ 日志卡（默认折叠一行）。
+
+端口、自检、`main/vd` 模式全部下沉进高级；原来散在界面的 8 个按钮只剩 1 个主 CTA。主 CTA 文案随状态走：
+
+```java
+if (busy || phase == Phase.STARTING) go = "正在启动…";
+else if (phase == Phase.STOPPING) go = "正在收尾…";
+else if (stale) go = "应用新配置";     // 投屏中改了需重启的参数
+else if (fresh) go = "投屏中";         // 已投且配置一致，灰
+else go = "启动投屏";
+```
+
+**② UI-10 / UX-08：三层小灯 + 用户级 4 态 + 工程级折叠**
+
+```
+灯：ADB 通 / 发送端 1 / 接收端 0 / 车机 62fps / 仪表 --fps（336ms）
+```
+
+三个 `dot` 分别对应 `dotAdb` / `dotSender` / `dotRecv`，`paintProcLamp()` 按进程数决定颜色：`≥1` 绿、`0` 红、探测失败灰。这是 B1 取消后「界面会说谎」的正解 —— 状态机只在动作时推进，小灯是**主动探测**，能把 adb 静默断开 / 发送端死了 / 接收端没起 这几种分开。
+
+用户级 4 态（胶囊）：`就绪` / `投屏中` / `投屏中 · 配置已改`（琥珀）/ `出错了`（红）。工程级原始 `status()` 收进日志卡的诊断模式。
+
+**③ UI-08 / UX-05：退出链路（本批最重要的一条）**
+
+返回键原来直接 `finish()`，两个进程留在车机和仪表上。现在：
+
+```java
+@Override
+public void onBackPressed() {
+    if (!advOpen && !logOpen) confirmExit();          // 带收尾的退出
+    else { if (advOpen) setAdvOpen(false); else setLogOpen(false); }  // 先收面板
+}
+```
+
+`confirmExit()` → 弹「退出应用」二次确认 → `runExit()`，总预算 **8000ms**：
+
+- 未投屏：直接关 socket + `finishAffinity()`，实测 **0ms**；
+- 投屏中：串 `stopCasting()` 的 `[1/4]…[4/4]`，实测 **5040–5513ms**，预算内；
+- 收尾不干净：弹「收尾未完成」，两个选项 ——「再收一次」/「强制退出」，**不许静默退出**；
+- 干净：`finishAffinity()` 后 `postDelayed(Process.killProcess, 500)`，彻底退进程（实测退出后 `pidof` 返回 `rc=1`）。
+
+**④ UX-12：restore 幂等 + 二次尝试 + 红色结论**
+
+原来 stop 失败一次会「看起来成功」——两次踩坑已修：
+
+1. `markConnected()` 不再覆盖 `ERROR`（只在 `IDLE` 时才肯进 `CONNECTED`），否则一次心跳探测就把红灯抹成「就绪」；
+2. `receiverEverStarted` **只在 `restoreOk` 时**才清 —— 之前失败一次就清掉，第二次 stop 会跳过恢复验证，直接报「收尾完成」，红灯被抹掉。
+
+判定仍以 `RESTORE_OK / pixels restored / RESTORED blank` 为唯一成功判据，返回值收紧为 `carOk && restoreOk`。
+
+**⑤ UI-11：日志默认折叠一行，出错自动展开，诊断模式**
+
+折叠态只显示一行摘要（`logSummary`），出错时摘要行变红并自动展开全文。展开态有「展开 / 清屏 / 诊断」三个按钮，行内 `setPadding(0,0,dp(110),0)` 给右下角车机悬浮球让出 110dp（车主说悬浮球可关，没关系，但不挡更好）。
+
+诊断入口两条路并存：**连点日志卡标题 5 次**（`logTitleTaps >= 5` → `enableDiag()`，保留原设计），以及一个**显式「诊断」按钮**。后者是必须的 —— 实测注入 tap 在 `TextView` / 整行 `LinearLayout` 上收不到（只有 `Button` 稳定），PC 侧自动化没法靠「连点 5 次」进诊断。
+
+**⑥ UX-09：首启 3 步引导**
+
+首次启动弹一次，三条硬前提：① adb 授权要选「一律允许」；② 仪表必须开机；③ 必须驻车操作。用 `SharedPreferences` 记位，仅首启显示。
+
+**⑦ 布局避让（B2 记的残点）**
+
+- root 顶部 padding 改 `dp(30)`：顶部系统状态栏（铃铛 / 电量 / 时间）原来会压住顶栏整行，胶囊放哪儿都看不见；
+- 日志行右侧 110dp 避让悬浮球（见 ⑤）；
+- `setAdvOpen(true)` 后 `bodySv.fullScroll(View.FOCUS_DOWN)`：高级展开后内容在可视区外，不滚过去等于没展开。
+
+**⑧ 遥控入口补齐（为 PC 侧与自动化）**
+
+```java
+case "health":  run(this::refreshHealth); break;
+case "exit":    runOnUiThread(this::confirmExit); break;   // 人用的路径：带确认
+case "exitnow": runOnUiThread(this::runExit); break;       // 自动化：无确认直接退
+case "coords":  runOnUiThread(this::dumpCoords); break;    // 打印关键控件物理坐标
+```
+
+`coords` 是本轮踩坑的产物：`ViewImage` 返回的截图是缩放后的 1080×525，而 `input tap` 要物理坐标（2400×1200）。`dumpCoords()` 直接打 `getLocationOnScreen`，用于自校准。
+
+**⑨ 顺手修的三条读数 bug**
+
+| 症状 | 根因 | 修法 |
+|---|---|---|
+| `RECV=-1`，fps 串到车机那行 | icrpc 回包前会粘一段 protobuf 残渣（`+.)RECV=0`），`split` 位置全错 | 改 `indexOf("RECV=")` 子串匹配 + `numText()` 取数 |
+| 接收端已死仍显示上一轮 fps | `frames=` 正则匹配到了退出时的 `stream idle/end: EOF (frames=826)` | 改 `grep -E 'frames=.*fps'`；进程数为 0 时 fps 直接置 `-1` |
+| 「仪表未恢复」被误报成「进程未确认退出」 | `exitProblem()` 里两个错误用了同一条 `if` 链 | 改成 if/else，只报真正失败的那一项 |
+
+### 怎么验的
+
+驻车、未导航、全程可回滚。全部走遥控入口触发，日志与截图存 `docs/materials/`（不入库）。
+
+| # | 场景 | 期望 | 实测 |
+|---|---|---|---|
+| 1 | 首启引导 | 只弹一次，二启不弹 | ✓ 三条硬前提，`SharedPreferences` 记位生效 |
+| 2 | 三层小灯（待机） | 三个灯各自独立 | ✓ `灯：ADB 通 / 发送端 1 / 接收端 0 / 车机 62fps / 仪表 --fps（336ms）`，一次探测 336ms |
+| 3 | 三层小灯（投屏中） | 接收端 1，仪表有 fps | ✓ `.nudgeCarFps` 补采：`车机 62 · 仪表 55.6 fps` |
+| 4 | 掉线感知 | 接收端灯变红并提示 | ✓ 手动杀掉仪表 `icrecv_dbg` 后，「接收端」灯转红，摘要行给出提示 |
+| 5 | 主 CTA 单一性 | 主界面只有一个主 CTA | ✓ 端口/自检/`main vd` 全部下沉高级；闲置时只有「启动投屏」可点 |
+| 6 | 停止四步 | `[1/4]`→`[4/4]`，结束给结论 | ✓ 全四步打印，`RESTORE_OK`，**`收尾完成，用时 4961 ms`** |
+| 7 | 退出（未投屏） | ≤8s，进程彻底退出 | ✓ **0ms**；`finishAffinity()` + kill，`pidof` → `rc=1` |
+| 8 | 退出（投屏中） | ≤8s | ✓ **5040 / 5289 / 5513ms**，预算 8s 内 |
+| 9 | 收尾未确认恢复 | 弹「收尾未完成」，不许静默退 | ✓ 两个选项「再收一次 / 强制退出」；选「再收一次」后 **`RESTORE_OK`，907ms 自愈** |
+| 10 | 错误态 | 胶囊红 + 日志自动展开 | ✓ `com.nonexistent.demo` → 胶囊「出错了」（红）、日志自动展开、摘要行红字 |
+| 11 | 返回键 | 走确认框，不裸退 | ✓ 弹「退出应用」；取消后 app 仍在前台（pid 15359） |
+| 12 | 退出后两端干净 | 无残留 | ✓ 车机无 VdSend、`残留虚拟屏: 0`、仪表无 `icrecv_dbg` |
+| 13 | 悬浮球遮挡 | 日志行按钮不被盖 | ✓ 右侧 110dp 避让 |
+| 14 | 状态栏压顶 | 顶栏整行可见 | ✓ root 顶部 `dp(30)` |
+
+离线 `bash adbprobe/test/run.sh` → `RESULT OK`（14 项断言）；构建 `BUILD OK`。
+
+### 还没做 / 已知残点
+
+1. **UI-09 的「预演在启动前」仍未落地**：流程条现在是 `连接 → 选应用 → 仪表区域 → 裁切画面 → 启动投屏 → 预览`，静态预演属于 B4，届时**顺序要再挪一次**。这是 B2 就记下的账，本批没动。
+2. **UX-04（启动自检四项 + 一键清理残留）/ UX-06（一键启动）/ UX-11（遥控语义统一）/ UI-12（进度条 + 可中断）** 仍未开始，仍是 B2 的遗留。本批只把「退出」这一侧的收尾做成闭环，「启动」那一侧的自检还是空的。
+3. **小灯是拉取式，不是推送式**：`refreshHealth()` 要主动点「刷新」或等动作触发才更新，掉线不会自己亮灯。做自动轮询需要常驻定时器，会牵扯功耗与 B1 已取消的重连策略，留到 UX-06 一起考虑。
+4. **`killvds stop` 的 4.35s 一点没动**：退出 5.0–5.5s 里绝大部分还是它，车主已确认在 B5 改轮询。
+5. **诊断模式只改日志详细度**，没有做 adb 包级 trace。
+
+### 回滚
+
+```bash
+git revert <本批 commit>
+```
+
+只动 `adbprobe/src/com/xiaopeng/vdcast/{MainActivity,VdCtl}.java`，**不涉及** `asx/`、`tools/icrecv2/`、投屏协议、仪表端 compose 命令行签名。若只想退「退出链路」这一条，把 `onBackPressed()` 改回直接 `finish()` 即可 —— 代价是恢复原状：留两个孤儿进程。
+
 ## B0 取证与基线（2026-11-05 14:30）
 
 ### 改了什么
