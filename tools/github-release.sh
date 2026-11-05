@@ -45,11 +45,10 @@ echo "=== 2/3 创建 release ${TAG}"
 payload=$(python - "$TAG" "$NAME" "$body" <<'EOF'
 import json, sys
 tag, name, extra = sys.argv[1], sys.argv[2], sys.argv[3]
-d = {"tag": tag}
+# GitHub API 要的是 tag_name（不是 tag）；name 缺省用 tag，否则 releases 列表里是空标题
+d = {"tag_name": tag, "name": tag, "draft": False, "prerelease": False, "body": ""}
 if extra:
     d.update(json.loads(extra))
-else:
-    d["body"] = ""
 print(json.dumps(d))
 EOF
 )
@@ -62,9 +61,16 @@ upload="${url%%\{*}"
 echo "    $html"
 
 echo "=== 3/3 上传 $NAME"
-curl -s -X POST "${AUTH[@]}" \
+out=$(curl -s -X POST "${AUTH[@]}" \
      -H "Content-Type: application/vnd.android.package-archive" \
-     --data-binary @"$APK" "${upload}?name=${NAME}" \
-  | python -c 'import json,sys; d=json.load(sys.stdin); print("    附件:", d.get("name","?"), d.get("size","?"), "bytes")'
+     --data-binary @"$APK" "${upload}?name=${NAME}")
+printf '%s' "$out" | python -c '
+import json, sys
+d = json.load(sys.stdin)
+if "id" not in d:
+    print("!! 上传失败：", json.dumps(d, ensure_ascii=False)[:400])
+    sys.exit(5)
+print("    附件:", d.get("name"), d.get("size"), "bytes  state=" + str(d.get("state")))
+' || exit 5
 
 echo "[OK] Release 完成：$html"
