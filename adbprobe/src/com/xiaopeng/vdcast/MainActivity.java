@@ -103,7 +103,7 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         // 由 refreshUi 按界面上的实际内容推导（见 refreshUiNow）
         refreshUi();
 
-        print("仪表投屏 v2.0");
+        print("仪表投屏 v2.1");
         print("流程：选应用 → 仪表区域 → 裁切画面 → 启动投屏 → 预览");
         setBusy(false);
         showGuideIfNeeded();
@@ -140,34 +140,121 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
 
     /**
      * 遥控入口：PC 侧一句 am start 就能驱动，不用在车机屏上摸黑点按钮。
-     *   am start -n com.xiaopeng.vdcast/.MainActivity --es act connect
-     *   --es act vd|main|stop|status|probe|apps|snap   --es pkg <pkg>   --es crop x,y,w,h
+     *
+     * <pre>
+     * am start -n com.xiaopeng.vdcast/.MainActivity --es 参数 … --es act 动作
+     * </pre>
+     *
+     * <p>语义（UX-11 统一定义；PC 侧 {@code tools/vdcast.sh}、文档 {@code docs/遥控入口-act-v1.md}
+     * 与这里同源，动作表见 {@link Acts}）：
+     * <ol>
+     *   <li><b>参数在前、act 最后</b>：am 会把 act 之后多出来的裸参数当 data URI，
+     *       {@code --es act crop 1,2,3,4} 的坐标就是这样被吃掉的（B0 基线 §3.3）；</li>
+     *   <li><b>只有声明消费的参数才生效</b>：{@code act=status} 不会顺手改 pkg；</li>
+     *   <li><b>必需参数缺失 = 拒绝</b>，绝不沿用界面旧值（那正是历史上静默出错的地方）；</li>
+     *   <li><b>旧名 vd / main / cluster 不再接受</b>，但打印该改成什么；</li>
+     *   <li>{@code act=help} 打印整张表。</li>
+     * </ol>
      */
     private void handleIntent(Intent it) {
         if (it == null) return;
-        String pkg = it.getStringExtra("pkg");
-        if (pkg != null && !pkg.isEmpty()) pkgEdit.setText(pkg);
-        String crop = it.getStringExtra("crop");
-        if (crop != null && !crop.isEmpty()) cropEdit.setText(crop);
-        String port = it.getStringExtra("port");
-        if (port != null && !port.isEmpty()) portEdit.setText(port);
-        String crect = it.getStringExtra("crect");
-        if (crect != null && !crect.isEmpty()) clusterEdit.setText(crect);
-
         String act = it.getStringExtra("act");
-        if (act == null || act.isEmpty()) return;
-        print("遥控 → " + act);
+        if (act == null || act.trim().isEmpty()) {
+            // 只带参数不带动作 = 什么都不做。以前会静默写界面字段，PC 侧根本看不出没生效。
+            if (hasAnyParam(it)) print("遥控：只收到参数没有 --es act，已忽略（动作表用 act=help）");
+            return;
+        }
+        act = act.trim().toLowerCase(java.util.Locale.US);
+
+        // 历史坑：`--es act crop 1,2,3,4` 里的坐标会被 am 吃掉 —— 落在 data URI（带 scheme 的值）
+        // 或者包名（纯坐标这种没有 scheme 的值，实测会变成 pkg=1,2,3,4）上。
+        // 收到这种「多出来的东西」就当场点出来，别让它悄悄沿用旧值。
+        android.net.Uri data = it.getData();
+        String stray = data != null ? data.toString() : null;
+        if (stray == null) {
+            String ip = it.getPackage();
+            if (ip != null && !ip.equals(getPackageName())) stray = ip;
+        }
+        if (stray != null) {
+            print("!! 参数写在了 --es act 之后，被 am 当成 "
+                    + (data != null ? "data URI" : "包名") + "：" + stray);
+            print("   " + Acts.ORDER_TIP);
+        }
+
+        String mig = Acts.deprecated(act);
+        if (mig != null) {
+            print("!! act=" + act + " 已改名：" + mig);
+            return;
+        }
+        if (!Acts.known(act)) {
+            print("!! 未知 act: " + act);
+            print("   可用：" + Acts.oneLine());
+            print("   完整表：--es act help");
+            return;
+        }
+        print("遥控 → " + act + argsSummary(it, act));
+
         switch (act) {
-            case "connect": run(() -> {
-                if (ensureConn()) print("已连接 " + adb.endpoint);
-            });
+            case "connect":
+                applyPortIfGiven(it);
+                run(() -> {
+                    if (ensureConn()) print("已连接 " + adb.endpoint);
+                });
                 break;
+            case "status":  run(this::showStatus); break;
+            case "health":  run(this::refreshHealth); break;
+            case "probe":   run(this::probe); break;
             case "apps":    run(this::dumpApps); break;
             case "pick":    run(this::pickApp); break;
-            case "vd":      run(() -> startWith("vd")); break;
-            case "main":    run(() -> startWith("main")); break;
+            case "area":    run(this::pickClusterArea); break;
+            case "snap":    run(this::frameCrop); break;
+            case "crop": {
+                String crop = opt(it, "crop");
+                if (crop == null) { missParam("crop", "crop", "x,y,w,h"); break; }
+                cropEdit.setText(crop);
+                run(() -> {
+                    if (!ensureCtl()) return;
+                    ctl.setCrop(crop);
+                    savePrefs();
+                    refreshUi();
+                });
+                break;
+            }
+            case "crect": {
+                String r = opt(it, "crect");
+                if (r == null) { missParam("crect", "crect", "x,y,w,h"); break; }
+                clusterEdit.setText(r);
+                savePrefs();
+                run(() -> {
+                    if (!ensureCtl()) return;
+                    applyClusterCfg();
+                    refreshUi();
+                    print("仪表投屏区 → " + r + "（投屏中改的，需重新启动才生效）");
+                });
+                break;
+            }
+            case "start": {
+                String pkg = opt(it, "pkg");
+                if (pkg != null) pkgEdit.setText(pkg);
+                String crop = opt(it, "crop");
+                if (crop != null) cropEdit.setText(crop);
+                String rect = opt(it, "crect");
+                if (rect != null) clusterEdit.setText(rect);
+                String mode = opt(it, "mode");
+                if (mode == null) mode = "vd";
+                if (!"vd".equals(mode) && !"main".equals(mode)) {
+                    print("!! --es mode 只认 vd / main，收到：" + mode);
+                    break;
+                }
+                if (pkgEdit.getText().toString().trim().isEmpty()) {
+                    print("!! act=start 需要 --es pkg（或先 act=pick 选一个）");
+                    break;
+                }
+                final String m = mode;
+                run(() -> startWith(m));
+                break;
+            }
             case "stop":    run(this::stopCasting); break;
-            case "health":  run(this::refreshHealth); break;
             // UX-04：启动自检 / 一键清理（PC 侧自动化用，等价于点顶栏那条横幅）
             case "residue": residueChecked = false; checkResidue(); break;
             case "clean":   runOnUiThread(this::cleanResidue); break;
@@ -178,33 +265,65 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
                 print("已请求中断：等当前这一步跑完就停");
             });
                 break;
-            // 把关键控件的屏幕坐标打到日志：PC 侧 input tap 老是点偏时用来自校准
-            case "coords":  runOnUiThread(this::dumpCoords); break;
+            case "preview": runOnUiThread(this::openPreview); break;
             // 仪表区域复位到安全区（PC 侧自动化用，等价于点面板上的「复位」）
             case "reset":   runOnUiThread(this::resetClusterArea); break;
+            // 把关键控件的屏幕坐标打到日志：PC 侧 input tap 老是点偏时用来自校准
+            case "coords":  runOnUiThread(this::dumpCoords); break;
             case "exit":    runOnUiThread(this::confirmExit); break;
             // 无确认直接退出：给 PC 侧和自动化留的口子（人用的路径必须走 confirmExit）
             case "exitnow": runOnUiThread(this::runExit); break;
-            case "crop":    run(() -> {
-                if (!ensureCtl()) return;
-                ctl.setCrop(cropEdit.getText().toString());
-                savePrefs();
-                refreshUi();
-            });
-                break;
-            case "status":  run(() -> { if (ensureCtl()) print(ctl.status()); }); break;
-            case "probe":   run(this::probe); break;
-            case "snap":    run(this::frameCrop); break;
-            case "cluster": run(this::pickClusterArea); break;
-            case "preview": runOnUiThread(this::openPreview); break;
             case "resync":
                 // 正常使用不需要：同步状态是进程级的，开 App 第一次启动时自动核对一次。
                 // 换过 dex/二进制、又不想杀进程时用这个强制重来。
                 VdCtl.resetToolCache();
                 print("已清掉工具同步标记，下次「启动」会重新核对并重推");
                 break;
-            default:        print("!! 未知 act: " + act);
+            case "help":    printActTable(); break;
+            default:        print("!! 未知 act: " + act); break;
         }
+    }
+
+    /** 该动作声明了消费、但没给 → 当场拒绝，并提示参数顺序（缺参数最常见的成因就是这个坑） */
+    private void missParam(String act, String key, String shape) {
+        print("!! act=" + act + " 缺 --es " + key + "（" + shape + "）");
+        print("   " + Acts.ORDER_TIP);
+    }
+
+    private void printActTable() {
+        print("遥控动作表（" + Acts.TABLE.length + " 条）");
+        for (String line : Acts.helpLines()) print("  " + line);
+    }
+
+    /** Intent 里该动作会消费的参数；不消费但带了的，在摘要里标出来 */
+    private String argsSummary(Intent it, String act) {
+        StringBuilder sb = new StringBuilder();
+        for (String k : new String[]{"pkg", "mode", "crop", "crect", "port"}) {
+            String v = opt(it, k);
+            if (v == null) continue;
+            sb.append(Acts.takes(act, k) ? " " : " [忽略] ").append(k).append('=').append(v);
+        }
+        return sb.toString();
+    }
+
+    private static boolean hasAnyParam(Intent it) {
+        for (String k : new String[]{"pkg", "mode", "crop", "crect", "port"}) {
+            if (opt(it, k) != null) return true;
+        }
+        return false;
+    }
+
+    private void applyPortIfGiven(Intent it) {
+        String port = opt(it, "port");
+        if (port != null) portEdit.setText(port);
+    }
+
+    /** 取字符串参数并 trim；空串等同于没给 */
+    private static String opt(Intent it, String key) {
+        String v = it.getStringExtra(key);
+        if (v == null) return null;
+        v = v.trim();
+        return v.isEmpty() ? null : v;
     }
 
     /** 「QQ音乐」这种口语化名字，比 com.tencent.qqmusicpad 好认；取不到就退回包名 */

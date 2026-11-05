@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 # 停止投屏：先停车机发送端，再给仪表端发 SIGTERM 让它自己 restore 回原仪表版面
+#
+# ⚠ 本脚本是**不经 APK** 的裸机直驱（基准测试 / APK 挂了时的兜底）。
+#   正常流程用 APK 的统一入口：bash tools/vdcast.sh stop（走 restore 幂等 + 红色结论）。
+#
 # 用法: bash stopcast.sh
 set -u
 # 传给 python / adb 的字符串里带 /tmp/... 这类路径，禁止 MSYS 改写

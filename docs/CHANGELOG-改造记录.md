@@ -3,6 +3,74 @@
 > 与 `docs/审计-四类改造-答复与需求确认-v1.md` 的批次一一对应。
 > 每条记录「改了什么 / 怎么验的 / 还有什么没做」，便于回滚与交接。
 
+## B2 收口：UX-11 遥控入口语义统一 + PC 脚本同源（2026-11-05 17:25）
+
+> B2 的最后一条。审计答复 §2.3 的要求：**同一套动作在 APK 与 PC 脚本上都存在且命名一致**，
+> 不允许再出现「脚本 7 步 / APK 8 步」的漂移。R3-2 明确「不要求向后兼容」，所以这一批是**改语义**，不是加兼容层。
+
+### 改了什么
+
+| 文件 | 变更 |
+|---|---|
+| `adbprobe/src/com/xiaopeng/vdcast/Acts.java` | **新增**。22 条动作表（动作 / 消费的参数 / 说明 / 等价界面），纯 `java.*`，离线测试直接编译；含 `ORDER_TIP`（参数在前、act 最后的唯一文案来源）与 `deprecated()` 迁移提示 |
+| `MainActivity.java` | 重写 `handleIntent`：动作名统一到 `Acts`；参数只属于声明消费它的动作；必需参数缺失直接拒绝；识别被 am 吃掉的多余参数（data URI / 包名）并点名；旧名给迁移提示；未知 act 打全表；新增 `act=help`。`act=status` 改走 `showStatus()`（与按钮同一条路径）。版本号打印改 2.1 |
+| `PreviewActivity.java` | 预览页「启动投屏」下发的遥控从 `act=vd` 改为 `act=start` + `mode=vd`（旧名已删） |
+| `tools/vdcast.sh` | **新增**。PC 侧唯一驱动：`build_cmd()` 固定「参数在前、`--es act` 最后」；`table` / `log` / `selftest` / `--dry-run` / `--wait`（前后数 logcat 次数）；只消费声明参数，带错参数直接退出码 2 |
+| `tools/startcast.sh` / `stopcast.sh` | 仅加头注：**不经 APK 的裸机直驱（7 步）**，正常流程走 `vdcast.sh`（8 步），两条路径不要混着数 |
+| `AndroidManifest.xml` | `versionCode 1 → 2`、`versionName 2.0 → 2.1`（改 APK 必带，便于确认装的是新版） |
+| `test/ActsTest.java` | **新增** 44 条断言：表本身、参数契约、迁移、help 覆盖，以及 **三处对账**——`Acts.TABLE` ↔ `MainActivity` 的 `case` ↔ `vdcast.sh` 的 `ACTS` |
+| `test/run.sh` | 编进 `Acts.java` / `ActsTest.java` 并执行 |
+| `docs/遥控入口-act-v1.md` | **新增**：五条规则、22 条动作表、PC 用法、迁移表、三层验证口径 |
+| `docs/APK控制器-v0.2.md` §2 | 旧表换成指针（避免第二份会漂的动作表） |
+| `docs/B0-基线数据-v1.md` §3.3 / §8 | 把「data URI」的说法修正为实测结论（纯坐标落成**包名**），复现命令改成脚本写法 |
+
+### 删除的 `act`（按 §2.3 要求在此写明）
+
+| 旧 | 新 |
+|---|---|
+| `vd` | `start --es mode vd` |
+| `main` | `start --es mode main` |
+| `cluster` | `area` |
+
+其余动作名保留；新增 `help` 与 `crect`（后者以前只能在 `start` 里顺带生效）。
+
+### 语义变化（会改变既有脚本行为的）
+
+1. **参数不再无条件写进界面**：`--es pkg` 只在 `start` 生效；`act=status` 带 `--es pkg` 会打 `[忽略]`。
+2. **必需参数缺失就拒绝**：`act=crop` 不带 `--es crop` → 报错停止，**不再沿用输入框里的旧值**。
+3. **只带参数不带 `act` 什么也不做**（以前会静默改界面字段）。
+4. 坐标被 am 吃掉时，日志会直接指出「写在了 `--es act` 之后」并给正确写法。
+
+### 怎么验的
+
+| 层 | 手段 | 结果 |
+|---|---|---|
+| 离线 | `bash adbprobe/test/run.sh` | MockAdbdTest OK；CfgTest `pass=27`；**ActsTest `pass=44 fail=0`** |
+| 脚本自检 | `bash tools/vdcast.sh selftest` | `pass=71 fail=0`（每条动作以 `--es act` 结尾、act 之后无裸 token） |
+| 构建 | `SKIP_ICRECV=1 bash adbprobe/build.sh` | `BUILD OK`，`AdbProbe.apk` 1438754 B |
+| 装机 | `tools/installapk.sh`（图形安装器） | 17:17:45 覆盖安装成功；`versionCode=2 / versionName=2.1`；`base.apk` md5 `c12d50d53f1b037bb75a1c95981bbe6e` 与本地一致 |
+| 车机·22 条动作 | `vdcast.sh` + `am start`（驻车，17:15–17:23） | 全部跑过；`help` 打出 22 条表；`crop/crect` 走脚本；`exit` 弹确认框、取消后进程仍在；`exitnow` 进程归零、重开正常 |
+| 车机·负例 | `--es act crop 1,2,3,4` | `!! 参数写在了 --es act 之后，被 am 当成 包名：1,2,3,4` + `!! act=crop 缺 --es crop` |
+| 车机·启动 | `start --pkg com.tencent.qqmusicpad --mode vd` | `[0/8]` 1216×360(安全区) → `DST 352,180 1216x360`、`frames=60 35.1fps`；`就绪` 用时 4–6s |
+| 车机·收尾 | `stop` | 两次 `RESTORE_OK`，`收尾完成 4931 / 4974 ms`，残留进程 0 / 虚拟屏 0，自检「干净」 |
+
+材料：`docs/materials/ux11/`（5 张截图 + 2 份 logcat）。
+
+### 没做的 / 已知残点
+
+1. **`pick` / `area` / `snap` 只验到「能打开、能取消」**，没为旧页面留截图 —— B4 会把它们换成网格页 / 来源角标 / 合成预览，旧页面不值得再取证。
+2. **`act=clean` 在没有残留时也会打印「残留已清理」**（实际啥也没清）—— 文案问题，归 B4 顺手改。
+3. **B4 加新动作时的同步点**：`Acts.TABLE` + `MainActivity` switch + `vdcast.sh` 的 `ACTS` 三处；漏一处 `ActsTest` 会失败。
+
+### 回滚
+
+```bash
+git revert <本批 commit>
+```
+
+不涉及 `asx/`、`tools/icrecv2/`、投屏协议与仪表端命令行，回滚只影响遥控入口与面板文案。
+若只想恢复旧动作名：把 `MainActivity` 的 `case "start"` 拆回 `vd`/`main` 即可，但 `ActsTest` 会报「表与 switch 不一致」——这是有意的。
+
 ## B2 遗留：启动自检 / 一键启动 / 进度条与中断（2026-11-05 16:55）
 
 B2 收口时留下四条，本批做掉三条：**UX-04 启动自检 + 一键清理残留**、**UX-06 一键启动**、**UI-12 进度条 + 可中断**。UX-11（遥控语义统一 + PC 脚本同步）仍留后批。

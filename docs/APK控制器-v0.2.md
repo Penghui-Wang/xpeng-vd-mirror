@@ -111,20 +111,22 @@ lambda 已被 d8 脱糖（dex 内 `invoke-custom` 计数为 0），入口 Activi
 
 ## 2. 遥控入口（PC 侧驱动）
 
+> **2026-11-05 UX-11 起，动作表与命令拼装统一由 `tools/vdcast.sh` 负责，
+> 语义说明见 [`遥控入口-act-v1.md`](遥控入口-act-v1.md)。** 本节只留结论，不再维护表。
+
 ```bash
-adb shell am start -n com.probe.adbprobe/.MainActivity --es act <动作> [--es pkg …] [--es crop x,y,w,h]
+bash tools/vdcast.sh <动作> [--pkg …] [--mode vd|main] [--crop x,y,w,h] [--crect x,y,w,h]
+bash tools/vdcast.sh table      # 看全部动作
 ```
 
-| act | 作用 |
-|---|---|
-| `connect` | 只连 adbd |
-| `apps` | 候选应用 + `#taskId bounds displayId` 打进 logcat |
-| `pick` | 弹应用选择框 |
-| `vd` / `main` | 按 pkg 启动对应模式 |
-| `stop` | 停止并复原窗口/仪表版面 |
-| `status` | 现状 |
-| `crop` | 把 `--es crop` 应用到运行中的投屏（热生效） |
-| `snap` | 截当前画面进拖框界面 |
+三条硬规矩（踩过坑，写在脚本里了）：
+
+1. **参数在前、`--es act` 最后** —— `am start` 会把 act 之后多出来的裸参数当 data URI，
+   `--es act crop 1,2,3,4` 的坐标就是这样丢的（B0 基线 §3.3）；
+2. **参数只属于声明消费它的动作**（`act=status` 不会顺手改 pkg）；
+3. **必需参数缺失直接拒绝**，不再静默沿用界面旧值。
+
+旧动作 `vd` / `main` / `cluster` 已删除，分别改成 `start --es mode vd|main` 与 `area`。
 
 用途：调 UI 时不用在车机屏上摸黑点按钮；也方便写自动化。
 

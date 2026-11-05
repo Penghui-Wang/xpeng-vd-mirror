@@ -160,10 +160,12 @@ public class PreviewActivity extends Activity {
             stopThreads();
             startThreads();
         });
-        // 主面板是 singleTask，把「启动 vd」这条遥控指令交给它自己走完整流程
+        // 主面板是 singleTask，把「启动 vd」这条遥控指令交给它自己走完整流程。
+        // UX-11 后动作统一为 act=start + mode，这里也跟着改（旧的 act=vd 已删除）。
         startCast.setOnClickListener(v -> {
             Intent i = new Intent(this, MainActivity.class);
-            i.putExtra("act", "vd");
+            i.putExtra("act", "start");
+            i.putExtra("mode", "vd");
             startActivity(i);
             hint = "已请求启动 vd，等画面…";
         });

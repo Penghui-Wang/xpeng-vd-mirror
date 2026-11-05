@@ -15,9 +15,13 @@ mkdir -p out
   ../src/com/xiaopeng/vdcast/Adb.java \
   ../src/com/xiaopeng/vdcast/Icrpc.java \
   ../src/com/xiaopeng/vdcast/VdCtl.java \
+  ../src/com/xiaopeng/vdcast/Acts.java \
   MockAdbdTest.java \
-  CfgTest.java
+  CfgTest.java \
+  ActsTest.java
 
 "$JAVA" -cp out MockAdbdTest
 # 投屏区口径断言（口径 B：默认必须落在安全区，全屏仍可用但不默认）
 "$JAVA" -cp out CfgTest
+# 遥控入口断言（UX-11：APK 动作表 / MainActivity switch / PC 脚本三处对账）
+"$JAVA" -cp out ActsTest
