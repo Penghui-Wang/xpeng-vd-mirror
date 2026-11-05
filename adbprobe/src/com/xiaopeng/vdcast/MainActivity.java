@@ -41,8 +41,13 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
     private static final int PORT_DEFAULT = 5050;
     private static final int REQ_CROP = 1001;
     private static final int REQ_CLUSTER = 1002;
-    /** 仪表默认投屏区 = 满宽横带，与 icrecv_dbg 的默认值一致 */
-    private static final String CRECT_DEFAULT = "0,72,1920,568";
+    /**
+     * 仪表默认投屏区 = 安全区 1216×360（43.8 万像素），不再是满宽横带。
+     *
+     * 2026-11-05 16:00 口径由 A 改 B：仪表是安全件，默认不该被投屏占满；
+     * 而且满宽横带 109 万像素会掉到 30~40 帧。数值与理由见 {@link VdCtl#DEF_RECT}。
+     */
+    private static final String CRECT_DEFAULT = VdCtl.DEF_RECT;
     private static final String PKG_DEFAULT = "com.tencent.qqmusicpad";
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
@@ -63,6 +68,8 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
     private Button btnHealth;
     /** 日志行的「诊断」按钮 */
     private Button btnDiag;
+    /** 仪表区域「复位」：一键回到安全区默认值 */
+    private Button btnReset;
     /** 中间那块可滚动的正文区（诊断用：触摸失效时要看它到底给了多大视口） */
     private ScrollView bodySv;
     /** 主 CTA 下方的「投屏区多大 / 大概能跑多少帧」提示 */
@@ -83,7 +90,13 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         cropEdit.setText(sp.getString("crop", "960,345,1440,426"));
         portEdit.setText(sp.getString("port", String.valueOf(PORT_DEFAULT)));
         pkgEdit.setText(sp.getString("pkg", PKG_DEFAULT));
-        if (clusterEdit != null) clusterEdit.setText(sp.getString("crect", CRECT_DEFAULT));
+        if (clusterEdit != null) {
+            // 一次性迁移：口径改 B（16:00）之前存的都是满宽横带 0,72,1920,568，
+            // 那是「全屏投放」，现在不再推荐。旧值直接换成安全区，不然改默认值等于白改。
+            String crect = sp.getString("crect", CRECT_DEFAULT);
+            if ("0,72,1920,568".equals(crect)) crect = CRECT_DEFAULT;
+            clusterEdit.setText(crect);
+        }
         // 流程条不再按 prefs 里有没有 key 打勾：配置存过不等于这次真的可用，
         // 由 refreshUi 按界面上的实际内容推导（见 refreshUiNow）
         refreshUi();
@@ -152,6 +165,8 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
             case "health":  run(this::refreshHealth); break;
             // 把关键控件的屏幕坐标打到日志：PC 侧 input tap 老是点偏时用来自校准
             case "coords":  runOnUiThread(this::dumpCoords); break;
+            // 仪表区域复位到安全区（PC 侧自动化用，等价于点面板上的「复位」）
+            case "reset":   runOnUiThread(this::resetClusterArea); break;
             case "exit":    runOnUiThread(this::confirmExit); break;
             // 无确认直接退出：给 PC 侧和自动化留的口子（人用的路径必须走 confirmExit）
             case "exitnow": runOnUiThread(this::runExit); break;
@@ -355,6 +370,7 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         if (btnPick != null) btnPick.setEnabled(!busy);
         if (btnFrame != null) btnFrame.setEnabled(!busy);
         if (btnCluster != null) btnCluster.setEnabled(!busy);
+        if (btnReset != null) btnReset.setEnabled(!busy);
         if (btnPreview != null) btnPreview.setEnabled(!busy);
         if (btnExit != null) btnExit.setEnabled(!busy);
     }
@@ -476,12 +492,15 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         // 顺序有意：先定「投到仪表哪里」，再框「车机取哪块」。
         // 裁切框选按投屏区的宽高比锁比例，反过来排会先裁一次再返工（UX-02）。
         LinearLayout c2 = card();
-        c2.addView(label("仪表投屏区域  1920×720 坐标，默认满宽横带"));
+        c2.addView(label("仪表投屏区域  1920×720 坐标，默认安全区 1216×360"));
         LinearLayout r3 = row();
-        clusterEdit = input("0,72,1920,568");
+        clusterEdit = input(CRECT_DEFAULT);
         r3.addView(clusterEdit, weight());
         btnCluster = mkButton("框选");
         r3.addView(btnCluster);
+        btnReset = mkButton("复位");
+        btnReset.setOnClickListener(v -> resetClusterArea());
+        r3.addView(btnReset);
         c2.addView(r3);
 
         c2.addView(label("车机画面裁切  x, y, w, h（按投屏区比例锁框）"));
@@ -513,7 +532,7 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         r4.addView(btnStop);
         c3.addView(r4);
 
-        // 面积提示（60 帧口径按 A：承认物理上限，把话说清楚，不拦用户选大区域）
+        // 安全件提醒：口径 16:00 由 A 改 B —— 默认收窄到安全区，超了就直说代价
         cfgHint = text("", 20, C_MUTED);
         cfgHint.setPadding(0, dp(5), 0, 0);
         c3.addView(cfgHint);
@@ -925,7 +944,7 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
                     + bodySv.getHeight() + "  scrollY=" + bodySv.getScrollY());
         }
         for (View v : new View[]{btnStartVd, btnStop, btnPreview, advHead, btnLogToggle, btnDiag,
-                btnExit, btnHealth, stateChip, pkgEdit, clusterEdit}) {
+                btnExit, btnHealth, stateChip, pkgEdit, clusterEdit, btnReset}) {
             if (v == null) continue;
             v.getLocationOnScreen(xy);
             print("  坐标 " + tagOf(v) + ": " + xy[0] + "," + xy[1]
@@ -981,12 +1000,23 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
     }
 
     /** 投屏区一行提示：面积 + 预期帧率（60 帧口径按 A） */
+    /**
+     * 投屏区一行的提示语（原「投屏区 550×384（自定义）· 21 万像素…」）。
+     *
+     * 2026-11-05 16:00 改文案：不再只报数字，而是先把「为什么该收窄」说清 ——
+     * 仪表是安全件，不建议全屏投放，且全屏投放帧率会下降。
+     * 具体文案由 {@link VdCtl#areaNote} 统一产出，日志与面板共用同一套档位。
+     */
     private String areaHint() {
         int[] r = rect(txt(clusterEdit));
-        if (r == null) return "投屏区域格式应为 x,y,w,h";
-        boolean band = r[0] == 0 && r[1] == 72 && r[2] == 1920 && r[3] == 568;
-        return "投屏区 " + r[2] + "×" + r[3] + (band ? "（满宽横带）" : "（自定义）")
-                + " · " + VdCtl.fpsHint(r[2], r[3]);
+        if (r == null) return "投屏区格式应为 x,y,w,h（默认安全区 " + CRECT_DEFAULT + "）";
+        return VdCtl.areaNote(r[2], r[3]);
+    }
+
+    /** 把仪表投屏区恢复成安全区默认值（1216×360 居中） */
+    private void resetClusterArea() {
+        clusterEdit.setText(CRECT_DEFAULT);
+        print("仪表区域已复位到安全区 " + CRECT_DEFAULT);
     }
 
     /** 解析 x,y,w,h；格式不对返回 null */
@@ -1239,8 +1269,10 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
                 savePrefs();
                 // ctl 还没建（没连过 adb）时不用急：startWith / frameCrop 都会再同步一次
                 if (ctl != null) applyClusterCfg();
+                int[] rr = rect(r);
                 print("仪表投屏区 -> " + r
-                        + (data.getBooleanExtra("custom", false) ? "（自定义）" : "（满宽横带）"));
+                        + (rr == null ? "" : "（" + VdCtl.areaText(rr[2], rr[3]) + "）"
+                        + ((long) rr[2] * rr[3] > VdCtl.AREA_SAFE ? "  ← 超出安全区" : "")));
                 refreshUi();
             }
             return;
@@ -1294,11 +1326,14 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         startActivityForResult(i, REQ_CLUSTER);
     }
 
-    /** 把界面上的仪表矩形写进 cfg；解析失败就退回满宽横带，绝不让脏值传到仪表端 */
+    /**
+     * 把界面上的仪表矩形写进 cfg。
+     *
+     * 解析失败退回**安全区**（不是满宽横带）：口径改 B 之后，兜底也该落在安全的那一侧 ——
+     * 脏值绝不能把整块仪表占满。
+     */
     private void applyClusterCfg() {
-        final int defY = ctl.cfg().top;
-        final int defH = 720 - ctl.cfg().top - ctl.cfg().bot;
-        int x = 0, y = defY, w = 1920, h = defH;
+        int x = VdCtl.DEF_CX, y = VdCtl.DEF_CY, w = VdCtl.DEF_CW, h = VdCtl.DEF_CH;
         boolean ok = false;
         String s = clusterEdit.getText().toString().trim();
         String[] p = s.split(",");
@@ -1312,10 +1347,10 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
             } catch (Exception ignored) { }
         }
         if (!ok) {
-            x = 0; y = defY; w = 1920; h = defH;
-            print("仪表区域格式不对，按默认满宽横带启动");
+            x = VdCtl.DEF_CX; y = VdCtl.DEF_CY; w = VdCtl.DEF_CW; h = VdCtl.DEF_CH;
+            print("仪表区域格式不对，按安全区 " + CRECT_DEFAULT + " 启动");
         }
-        ctl.cfg().cCustom = !(x == 0 && y == defY && w == 1920 && h == defH);
+        ctl.cfg().cCustom = !VdCtl.isFullBandRect(x, y, w, h, ctl.cfg().top, ctl.cfg().bot);
         ctl.cfg().cX = x;
         ctl.cfg().cY = y;
         ctl.cfg().cW = w;
@@ -1323,6 +1358,11 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         // 立刻对齐 outW/outH：框选页要用它锁比例，启动前也要靠它算发送尺寸。
         // 以前只在 start() 里同步，改完矩形马上去框选会锁到上一次的比例（UI-13）。
         ctl.cfg().normalize();
+        // 超安全区就留一条日志，事后能对上是哪次配置选了大区域
+        if ((long) ctl.cfg().cW * ctl.cfg().cH > VdCtl.AREA_SAFE && ctl.cfg().cCustom) {
+            print("!! 投屏区 " + VdCtl.areaText(ctl.cfg().cW, ctl.cfg().cH)
+                    + " 超出安全区，仪表是安全件，不建议铺满");
+        }
     }
 
     private void startWith(String mode) {

@@ -20,13 +20,62 @@ public final class VdCtl {
 
     public interface Log { void print(String s); }
 
+    // ============================================================ 投屏区口径
+
+    /** 仪表 fb1 尺寸，也是仪表投屏矩形的坐标系 */
+    public static final int CL_W = 1920;
+    public static final int CL_H = 720;
+
+    /**
+     * 推荐投屏区面积上限（像素）。**只用来定默认方案，不当作帧率承诺。**
+     *
+     * 60Hz 预算 16.7ms，扣掉 read/draw/flush 只剩 10~11ms，按仪表端解码 ≈20~24 ns/px
+     * 反推面积上限约 45~55 万像素（见 docs/B0-基线数据-v1.md §7）。
+     *
+     * 但**实际帧率还受画面复杂度影响**（静态图与高动态画面的解码/绘制成本不同），
+     * 所以面板上不承诺帧率，只说面积 —— 真帧率看三层小灯的实测值。
+     *
+     * 口径在 2026-11-05 16:00 由「A：承认物理上限、按面积分档」改为
+     * 「B：默认矩形直接收窄到安全区」——理由是**仪表是安全件**，不该默认被投屏占满。
+     * 全屏仍能做，只是不推荐。
+     */
+    public static final int AREA_SAFE = 500000;
+
+    /**
+     * 推荐默认矩形：1216×360 = **43.8 万像素**，居中于 1920×720（x=352, y=180）。
+     *
+     * 为什么是这几个数：
+     * 1. 默认 crop 1440×426 是 3.38:1，只有等比才不会变形；1216×360 差 0.07%，肉眼看不出。
+     * 2. 面积压在 45 万一线之下（按解码预算推算的上限），但**不承诺任何帧率** ——
+     *    实际帧率随画面复杂度浮动，面板只报面积。
+     * 3. 四个数都是偶数，且 x/y 正好整除：352×2+1216=1920、180×2+360=720，
+     *    严格居中，不用为奇偶对齐做偏移。
+     *
+     * 缩放 0.845×（原满宽横带是 1.33× 放大），画质不但没降，反而更锐。
+     */
+    public static final int DEF_CX = 352;
+    public static final int DEF_CY = 180;
+    public static final int DEF_CW = 1216;
+    public static final int DEF_CH = 360;
+    public static final String DEF_RECT = DEF_CX + "," + DEF_CY + "," + DEF_CW + "," + DEF_CH;
+
+    /**
+     * 是否「满宽横带」，也就是全屏投放。
+     *
+     * 仍然保留这条路径：车主想临时看全屏时可以手动填 0,top,1920,720-top-bot，
+     * 但默认不再走它 —— 默认是 {@link #DEF_RECT}。
+     */
+    public static boolean isFullBandRect(int x, int y, int w, int h, int top, int bot) {
+        return x == 0 && y == top && w == CL_W && h == CL_H - top - bot;
+    }
+
     /** 启动参数 */
     public static final class Cfg {
         public String mode = "vd";                 // vd | main
         public int fps = 60;
         public int hold = 86400;                   // 仪表端断流超时，每来一帧重置
-        public int outW = 1920;
-        public int outH = 568;                     // 必须 = 720 - top - bot
+        public int outW = DEF_CW;
+        public int outH = DEF_CH;
         public int top = 72;
         public int bot = 80;
         public String pkg = "com.tencent.qqmusicpad";
@@ -36,14 +85,16 @@ public final class VdCtl {
         public int previewPort = 5570;
         /**
          * 仪表端投屏矩形（fb1 坐标，1920×720）。
-         * cCustom=false 时忽略，行为等于原来的满宽横带（0,top,1920,720-top-bot）。
-         * cCustom=true 时 outW/outH 会自动跟 cW/cH 对齐，避免拉伸变形。
+         *
+         * cCustom=true（默认）：用下面的 cX/cY/cW/cH，出厂值即安全区 1216×360（43.8 万像素，跑满 60 帧）。
+         * cCustom=false：满宽横带 0,top,1920,720-top-bot = 全屏投放。仍支持，但不推荐 ——
+         *   仪表是安全件，全屏会把它整个盖住，且面积 109 万像素时帧率只有 30~40。
          */
-        public boolean cCustom = false;
-        public int cX = 0;
-        public int cY = 72;
-        public int cW = 1920;
-        public int cH = 568;
+        public boolean cCustom = true;
+        public int cX = DEF_CX;
+        public int cY = DEF_CY;
+        public int cW = DEF_CW;
+        public int cH = DEF_CH;
 
         /**
          * 把「仪表投屏矩形」和「发送尺寸」对齐。幂等，可以在任何时机反复调。
@@ -58,18 +109,19 @@ public final class VdCtl {
          */
         public void normalize() {
             if (cCustom) {
-                cW = Math.max(2, Math.min(1920, cW));
-                cH = Math.max(2, Math.min(720, cH));
+                cW = Math.max(2, Math.min(CL_W, cW));
+                cH = Math.max(2, Math.min(CL_H, cH));
                 if (cX < 0) cX = 0;
                 if (cY < 0) cY = 0;
-                if (cX + cW > 1920) cX = 1920 - cW;
-                if (cY + cH > 720) cY = 720 - cH;
+                if (cX + cW > CL_W) cX = CL_W - cW;
+                if (cY + cH > CL_H) cY = CL_H - cH;
             } else {
-                // 满宽横带：矩形由 top/bot 决定，忽略外部填进来的 cX/cY/cW/cH
+                // 满宽横带 = 全屏投放：矩形由 top/bot 决定，忽略外部填进来的 cX/cY/cW/cH。
+                // 这条分支现在只是「车主手动要看全屏」的可选路径，默认不走它。
                 cX = 0;
                 cY = top;
-                cW = 1920;
-                cH = Math.max(2, 720 - top - bot);
+                cW = CL_W;
+                cH = Math.max(2, CL_H - top - bot);
             }
             outW = cW;
             outH = cH;
@@ -78,8 +130,21 @@ public final class VdCtl {
         /** 投屏区像素数，用于按面积判断帧率预期（见 docs/B0-基线数据-v1.md §7） */
         public int areaPx() { return cW * cH; }
 
-        /** 是否按「满宽横带」投（没有自定义矩形） */
+        /** 面积是否在安全区内（≤ {@link #AREA_SAFE}） */
+        public boolean inSafeArea() { return (long) cW * cH <= AREA_SAFE; }
+
+        /** 是否按「满宽横带」投（= 全屏投放，不推荐） */
         public boolean isFullBand() { return !cCustom; }
+
+        /** 把矩形恢复成推荐默认值（安全区），幂等 */
+        public void useSafeDefault() {
+            cCustom = true;
+            cX = DEF_CX;
+            cY = DEF_CY;
+            cW = DEF_CW;
+            cH = DEF_CH;
+            normalize();
+        }
     }
 
     private static final String DEX = "/data/local/tmp/vd.dex";
@@ -166,22 +231,35 @@ public final class VdCtl {
     public Cfg cfg() { return cfg; }
 
     /**
-     * 按 B0 实测标定给一条「这块面积大概能跑到多少帧」的预期（不是保证值）。
+     * 投屏区的面积描述。**只说面积，不说帧率。**
      *
-     * 口径见 docs/B0-基线数据-v1.md §7：仪表端解码 ≈20~24 ns/px，60Hz 预算扣掉
-     * read/draw/flush 后只剩 10~11ms，所以面积上限约 45~55 万像素。
-     * 实测 55.0 万以下（550x384 = 21 万）跑满 61.8 帧，满宽横带 1920x568 = 109 万
-     * 只有 30~39 帧。这里只负责把话说清楚，不拦用户选大区域。
+     * 之前这里会给「可跑满 60 帧 / 约 55~60 帧 / 约 30~40 帧」这类档位，
+     * 2026-11-05 16:12 车主明确要求去掉：帧率受画面复杂度影响，静态画面和高动态
+     * 画面不是一回事，写死档位等于给自己挖坑。真帧率一律以三层小灯的实测值为准。
      */
-    public static String fpsHint(int w, int h) {
+    public static String areaText(int w, int h) {
+        return w + "×" + h + " · "
+                + String.format(Locale.US, "%.1f 万像素", (long) w * h / 10000.0);
+    }
+
+    /**
+     * 面板上的投屏区提醒：把它当成**方案选择**来说，不承诺帧率。
+     *
+     * 原来这一行是「投屏区 550×384（自定义）· 21 万像素，可跑满 60 帧」——
+     * 只报数字，不解释为什么该收窄。现在改成把理由说在前面：
+     * **仪表是安全件，不建议全屏投放；面积越大，帧率越容易掉。**
+     *
+     * @return 一行提示，超安全区时以「⚠」开头
+     */
+    public static String areaNote(int w, int h) {
         long px = (long) w * h;
-        String area = String.format(Locale.US, "%.0f 万像素", px / 10000.0);
-        String band;
-        if (px <= 450000) band = "可跑满 60 帧";
-        else if (px <= 600000) band = "临界，约 55~60 帧";
-        else if (px <= 900000) band = "约 40~50 帧";
-        else band = "约 30~40 帧（接近满宽，物理上限）";
-        return area + "，" + band;
+        String size = areaText(w, h);
+        if (px > AREA_SAFE) {
+            // 显式换行：整句太长会顶到卡片右边，读起来像被裁掉
+            return "⚠ 仪表为安全件，不建议全屏投放：当前 " + size + "\n"
+                    + "面积越大帧率越容易掉，建议改回安全区 " + DEF_RECT;
+        }
+        return "仪表为安全件，建议只用安全区（默认 " + DEF_RECT + "）：当前 " + size;
     }
 
     // ============================================================ 启动
@@ -205,7 +283,8 @@ public final class VdCtl {
             }
             log.print("  ok (mode=" + cfg.mode + ", 目标=" + cfg.pkg + ", "
                     + cfg.outW + "x" + cfg.outH + ", " + cfg.fps + "fps)");
-            log.print("  投屏区 " + cfg.cW + "x" + cfg.cH + "，" + fpsHint(cfg.cW, cfg.cH));
+            log.print("  投屏区 " + areaText(cfg.cW, cfg.cH)
+                    + (cfg.areaPx() > AREA_SAFE ? "  (超出安全区)" : "  (安全区)"));
 
             // 发送端只认 vdcrop.txt（它靠这个文件热重载），所以启动前必须把界面上
             // 当前填的裁切值落盘，否则用户改了输入框没点「应用」就直接启动，

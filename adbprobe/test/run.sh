@@ -14,6 +14,10 @@ mkdir -p out
   android/util/Base64.java \
   ../src/com/xiaopeng/vdcast/Adb.java \
   ../src/com/xiaopeng/vdcast/Icrpc.java \
-  MockAdbdTest.java
+  ../src/com/xiaopeng/vdcast/VdCtl.java \
+  MockAdbdTest.java \
+  CfgTest.java
 
 "$JAVA" -cp out MockAdbdTest
+# 投屏区口径断言（口径 B：默认必须落在安全区，全屏仍可用但不默认）
+"$JAVA" -cp out CfgTest

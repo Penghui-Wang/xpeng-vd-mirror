@@ -22,7 +22,8 @@ import java.io.InputStream;
  * 仪表投屏区域选择页。
  *
  * 底图用打包进来的 fb0_pre.png（原生 1920x720，与仪表 fb1 坐标系一致，不用换算），
- * 红色框 = 投屏矩形，默认就是现在的满宽横带 (0,72,1920,568)。
+ * 红色框 = 投屏矩形，出厂默认是安全区 (352,180,1216,360) —— 43.8 万像素、可跑满 60 帧。
+ * 「安全区」按钮一键回这个值；铺满整条仍然允许，但会提示帧率代价（仪表是安全件）。
  * 框压到上下状态栏时给一条安全提醒，但仍然允许确定。
  */
 public class ClusterPickActivity extends Activity {
@@ -70,10 +71,18 @@ public class ClusterPickActivity extends Activity {
         view.setOnChangeListener(r -> {
             int cy = r.top, ch = r.height(), cx = r.left, cw = r.width();
             boolean bad = cy < top || cy + ch > 720 - bot;
-            hint.setText(bad
-                    ? "⚠ 压到状态栏了（挡位/温度/时间可能被遮住），仍可确定"
-                    : "投屏区 " + cx + "," + cy + "  " + cw + "×" + ch);
-            hint.setTextColor(bad ? 0xFFFFB020 : 0xFF9AA4AF);
+            long px = (long) cw * ch;
+            if (bad) {
+                hint.setText("⚠ 压到状态栏了（挡位/温度/时间可能被遮住），仍可确定");
+                hint.setTextColor(0xFFFFB020);
+            } else if (px > VdCtl.AREA_SAFE) {
+                // 安全件提醒：不拦，但把「为什么不该铺满」说清；不给帧率数字（随画面复杂度变）
+                hint.setText("⚠ 仪表为安全件，不建议铺满：当前 " + VdCtl.areaText(cw, ch));
+                hint.setTextColor(0xFFFFB020);
+            } else {
+                hint.setText("投屏区 " + cx + "," + cy + "  " + VdCtl.areaText(cw, ch));
+                hint.setTextColor(0xFF9AA4AF);
+            }
         });
         root.addView(view, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -91,9 +100,10 @@ public class ClusterPickActivity extends Activity {
         bar.addView(hint, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-        Button reset = mkBtn("整条");
+        Button reset = mkBtn("安全区");
         reset.setOnClickListener(v -> {
-            view.setCrop(new Rect(0, top, 1920, 720 - bot));
+            view.setCrop(new Rect(VdCtl.DEF_CX, VdCtl.DEF_CY,
+                    VdCtl.DEF_CX + VdCtl.DEF_CW, VdCtl.DEF_CY + VdCtl.DEF_CH));
         });
         bar.addView(reset);
 
@@ -112,8 +122,8 @@ public class ClusterPickActivity extends Activity {
             Rect r = view.getCrop();
             Intent out = new Intent();
             out.putExtra("crect", r.left + "," + r.top + "," + r.width() + "," + r.height());
-            out.putExtra("custom", !(r.left == 0 && r.top == top
-                    && r.width() == 1920 && r.height() == 720 - top - bot));
+            out.putExtra("custom", !VdCtl.isFullBandRect(
+                    r.left, r.top, r.width(), r.height(), top, bot));
             setResult(RESULT_OK, out);
             finish();
         });
