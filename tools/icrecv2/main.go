@@ -1161,8 +1161,27 @@ func (d *display) flushFrame() {
 	d.writeBack(off, end)
 }
 
-func (d *display) refreshBands() {
-	if d.fb0 == nil {
+// paintAllFromFB0: 把当前 fb0（原车仪表画面）整幅铺到后台缓冲。
+//
+// 只用在 compose 启动、首帧到达之前：让仪表先保持「原车画面」，等第一帧到了
+// 再由流覆盖投屏矩形。之前没有这一步，fb1 里是上一轮的旧像素，宽屏拉伸后
+// 会闪一张像「仪表盘效果图」的画面。
+func (d *display) paintAllFromFB0() {
+	if d.fb0 == nil || d.fb0Var == nil {
+		return
+	}
+	h := int(d.fb0Var.Yres)
+	for y := 0; y < targetH; y++ {
+		sy := y
+		if sy >= h {
+			sy = h - 1
+		}
+		d.blitRowFromFB0(y, sy)
+	}
+	logf("PREPAINT fb0 %dx%d (首帧前先铺原车画面)", targetW, targetH)
+}
+
+func (d *display) refreshBands() {	if d.fb0 == nil {
 		return
 	}
 	for y := 0; y < d.top; y++ {
@@ -2054,6 +2073,12 @@ func cmdCompose(port, hold, top, bot, cards, rx, ry, rw, rh int) {
 	}
 	d.refreshBands()
 	d.enableBlend()
+	// 首帧到达前必须先把 fb1 铺成「当前原车画面」。
+	// 否则宽屏模式一切换，fb1 里残留的是上一次会话的旧像素（通常是原车仪表画面），
+	// 被拉伸到 1920×720 后看起来就像一张「仪表盘效果图」闪一下（用户 2026-11-05 反馈）。
+	d.paintAllFromFB0()
+	d.flush()
+	d.submit()
 
 	sig := make(chan os.Signal, 2)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)

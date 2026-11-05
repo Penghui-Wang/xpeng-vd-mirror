@@ -1348,6 +1348,28 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
     }
 
     /** 解析 x,y,w,h；格式不对返回 null */
+    /**
+     * 「[960,0][2400,1080]」→ {x, y, w, h}。解析不出来返回 null。
+     *
+     * 只用于「没投屏时把底图裁到目标应用窗口」；拿不到就退回整张主屏，不影响主流程。
+     */
+    private static int[] parseBounds(String b) {
+        if (b == null) return null;
+        try {
+            String[] p = b.replace("[", " ").replace("]", " ").replace(",", " ")
+                    .trim().split("\\s+");
+            if (p.length < 4) return null;
+            int x0 = Integer.parseInt(p[0]);
+            int y0 = Integer.parseInt(p[1]);
+            int x1 = Integer.parseInt(p[2]);
+            int y1 = Integer.parseInt(p[3]);
+            if (x1 <= x0 || y1 <= y0) return null;
+            return new int[]{x0, y0, x1 - x0, y1 - y0};
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     private static int[] rect(String s) {
         if (s == null) return null;
         String[] p = s.trim().split(",");
@@ -1522,14 +1544,52 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
             // 拿到上一次的旧比例会把画面裁歪（UI-13）。
             applyClusterCfg();
             print("取当前画面作底图…");
-            byte[] png = ctl.snapshot();
+            // 没投屏时底图只能截主屏，而面板本身正好盖在同一个窗口区域上 ——
+            // 不把目标应用提到前台，截到的就是「我们自己」。提上来、截完再拉回来。
+            // 注意：必须现场判断有没有虚拟屏，不能拿 ctl.shotSource 当依据 ——
+            // 那是**上一次** snapshot() 留下的值，会误判。
+            final String targetPkg = ctl.cfg().pkg;
+            boolean lifted = false;
+            if (ctl.vdDisplayId() <= 0 && targetPkg != null && !targetPkg.isEmpty()) {
+                try {
+                    adb.exec("monkey -p " + targetPkg
+                            + " -c android.intent.category.LAUNCHER 1", 20000);
+                    Thread.sleep(500);
+                    lifted = true;
+                } catch (Throwable ignored) { }
+            }
+            byte[] png;
+            try {
+                png = ctl.snapshot();
+            } finally {
+                if (lifted) {
+                    try {
+                        adb.exec("am start -n com.xiaopeng.vdcast/.MainActivity", 12000);
+                    } catch (Throwable ignored) { }
+                }
+            }
             File f = new File(getCacheDir(), "crop.png");
             try (FileOutputStream fo = new FileOutputStream(f)) {
                 fo.write(png);
             }
             print("  已取到 " + png.length / 1024 + " KB，进拖框界面");
 
-            final String src = ctl.shotSource;   // UI-02：底图来源带进页面并标出来
+            // UI-02：底图来源带进页面并标出来。
+            // 没投屏（没有虚拟屏）时，主屏上画着我们自己的面板和别的窗口 —— 直接给整张主屏，
+            // 用户框出来的往往不是目标应用的画面。这里优先把底图裁到「目标应用窗口」，
+            // 看到的就是真正会投出去的那块；返回的坐标再由裁切页加回主屏偏移。
+            int[] win = null;
+            String src = ctl.shotSource;
+            if (ctl.shotDisplay == 0) {
+                VdCtl.TaskInfo ti = null;
+                try { ti = ctl.findTask(ctl.cfg().pkg); } catch (Throwable ignored) { }
+                if (ti != null && ti.displayId == 0) {
+                    win = parseBounds(ti.bounds);
+                    if (win != null) src = "目标应用窗口（主屏）";
+                }
+            }
+            final int[] fwin = win;
+            final String fsrc = src;
 
             final String crop = cropEdit.getText().toString().trim();
             // UI-13：锁比例要按「仪表区域」这一行算，而不是 cfg.outW/outH。
@@ -1545,7 +1605,13 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
                 i.putExtra("crect", crectTxt);
                 i.putExtra("out_w", ow);
                 i.putExtra("out_h", oh);
-                i.putExtra("src", src);
+                i.putExtra("src", fsrc);
+                if (fwin != null) {
+                    i.putExtra("view_x", fwin[0]);
+                    i.putExtra("view_y", fwin[1]);
+                    i.putExtra("view_w", fwin[2]);
+                    i.putExtra("view_h", fwin[3]);
+                }
                 startActivityForResult(i, REQ_CROP);
             });
         } catch (Throwable t) {

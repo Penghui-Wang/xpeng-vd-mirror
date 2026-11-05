@@ -31,6 +31,8 @@ public class CropActivity extends Activity {
     private String ratioFrom = "";
     /** UI-02：这张底图是从哪儿截的（虚拟屏 / 目标应用窗口 / 主屏），页面左上角必须标出来 */
     private String src = "";
+    /** 底图被裁到「目标应用窗口」时，返回坐标要加回去的偏移（主屏绝对坐标） */
+    private int viewOffX, viewOffY;
 
     @Override
     protected void onCreate(Bundle b) {
@@ -69,6 +71,19 @@ public class CropActivity extends Activity {
             setResult(RESULT_CANCELED);
             finish();
             return;
+        }
+        // 没投屏时没有虚拟屏可截，底图只能是主屏。为了让用户看到「将要投出去的那块」，
+        // 主面板会把目标应用窗口的矩形传进来，这里只显示窗口那部分，返回时再把偏移加回去。
+        int vx = in.getIntExtra("view_x", 0);
+        int vy = in.getIntExtra("view_y", 0);
+        int vw = in.getIntExtra("view_w", 0);
+        int vh = in.getIntExtra("view_h", 0);
+        if (vw > 0 && vh > 0 && vx >= 0 && vy >= 0
+                && vx + vw <= bmp.getWidth() && vy + vh <= bmp.getHeight()) {
+            bmp = Bitmap.createBitmap(bmp, vx, vy, vw, vh);
+            viewOffX = vx;
+            viewOffY = vy;
+            if (src == null || src.isEmpty()) src = "目标应用窗口";
         }
         setContentView(buildUi(bmp, in.getStringExtra("crop")));
     }
@@ -129,7 +144,12 @@ public class CropActivity extends Activity {
         view = new CropView(this);
         view.setBitmap(bmp);
         Rect init = parse(cropStr);
-        if (init != null) view.setCrop(init);
+        if (init != null) {
+            // 底图被裁成「应用窗口」时，存量的裁切矩形是主屏绝对坐标，先换成图内坐标
+            init.offset(-viewOffX, -viewOffY);
+            init.intersect(0, 0, bmp.getWidth(), bmp.getHeight());
+            if (!init.isEmpty()) view.setCrop(init);
+        }
         view.setRatio(ratio);
         view.setInsetBottom(barH);
         view.setOnChangeListener(r -> hint.setText(
@@ -208,7 +228,9 @@ public class CropActivity extends Activity {
         ok.setOnClickListener(v -> {
             Rect r = view.getCrop();
             Intent out = new Intent();
-            out.putExtra("crop", r.left + "," + r.top + "," + r.width() + "," + r.height());
+            // 图内坐标 → 主屏绝对坐标（底图是应用窗口时才有偏移）
+            out.putExtra("crop", (r.left + viewOffX) + "," + (r.top + viewOffY) + ","
+                    + r.width() + "," + r.height());
             setResult(RESULT_OK, out);
             finish();
         });
