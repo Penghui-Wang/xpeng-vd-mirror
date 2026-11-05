@@ -1769,11 +1769,12 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
     }
 
     /**
-     * 启动后补一次车机帧率。
+     * 启动后 3 秒补一次健康探测。
      *
-     * VdSend 是每 2 秒才打第一行 `fps=`，启动流程跑到 [7/8] 时经常还没输出，
-     * 于是灯全绿但「车机 --」。这里单独起个线程等 3 秒再取一次 ——
-     * 不走 worker（会占住后续操作），也不影响启动耗时。
+     * <p>B5-A 之后 `[7/8]` 不再等那 2 秒：接收端第一帧就报 `frames=`，启动能省 1.6s，
+     * 代价是**那一刻两侧的 fps 还没打出来**（VdSend 每 2 秒打一行、icrecv 每 60 帧打一行）。
+     * 所以 3 秒后补跑一次和「刷新」完全相同的探测，把三层小灯与 fps 补齐 ——
+     * 只在后台线程补，不占启动时间。
      */
     private void nudgeCarFps() {
         final Adb a = adb;
@@ -1781,17 +1782,11 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
             try {
                 Thread.sleep(3000);
                 if (!a.isConnected()) return;
-                String out = a.exec("grep 'fps=' /data/local/tmp/vdsend.log 2>/dev/null | tail -1", 12000);
-                final double fps = numOf(out, "fps=(\\d+(?:\\.\\d+)?)");
-                if (fps < 0) return;
-                VdCtl.Health h = lastHealth;
-                if (h == null) return;
-                h.carFps = fps;
-                runOnUiThread(() -> {
-                    if (fpsView != null) {
-                        fpsView.setText("车机 " + h.carsFpsText()
-                                + " · 仪表 " + h.icFpsText() + " fps");
-                    }
+                if (worker.isShutdown()) return;
+                worker.execute(() -> {
+                    try {
+                        refreshHealth();
+                    } catch (Throwable ignored) { }
                 });
             } catch (Throwable ignored) { }
         }, "fps-nudge");

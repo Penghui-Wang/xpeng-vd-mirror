@@ -2300,6 +2300,11 @@ func handleStream(d *display, conn net.Conn, hold int, deadline *time.Timer) {
 			sumRead += t1.Sub(tR)
 			sumDec += t2.Sub(t1)
 			frames++
+			if frames == 1 {
+				// B5-A：第一帧就报一声，别等到第 60 帧（35fps 下要 1.7s）。
+				// 上位机（APK 的 [7/8]）就是靠日志里出现 "frames=" 判断「真的收到帧了」。
+				logf("frames=1 first frame (recv %dx%d)", w, h)
+			}
 			deadline.Reset(time.Duration(hold) * time.Second)
 			if frames%60 == 0 {
 				el := time.Since(t0).Seconds()
@@ -2331,6 +2336,10 @@ func handleStream(d *display, conn net.Conn, hold int, deadline *time.Timer) {
 		sumTotal += t4.Sub(tR)
 
 		frames++
+		if frames == 1 {
+			// B5-A：同上，首帧即报，省掉 1.7s 的「等第 60 帧」。
+			logf("frames=1 first frame (recv %dx%d)", w, h)
+		}
 		deadline.Reset(time.Duration(hold) * time.Second)
 		if frames%60 == 0 {
 			el := time.Since(t0).Seconds()

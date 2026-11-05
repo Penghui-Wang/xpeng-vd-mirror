@@ -390,7 +390,7 @@ public final class VdCtl {
             log.print("  " + DEX + " (" + dexSize + " B)");
 
             if (step(2, 8, "停旧发送端（先 TERM 让 vd 模式把窗口搬回去）")) return false;
-            String out = adb.exec("sh " + KILLVDS + " stop " + cfg.pkg, 45000);
+            String out = killSender(cfg.pkg);
             for (String line : tail(out, 3).split("\n")) {
                 if (!line.trim().isEmpty()) log.print("  " + line.trim());
             }
@@ -413,10 +413,16 @@ public final class VdCtl {
                                 + "可在「高级 → 自检」看仪表侧是否可达");
             }
 
-            if (step(5, 8, "起仪表接收端（投屏区 "
+            if (step(5, 8, "起两端（发送端后台 + 接收端，并行）"
+                    + "（投屏区 "
                     + (cfg.cCustom ? cfg.cX + "," + cfg.cY + " " + cfg.cW + "x" + cfg.cH
                                    : "满宽横带 y=" + cfg.top + ".." + (720 - cfg.bot))
                     + "）")) return false;
+            // B5-C：发送端从「拉起」到 capture ready 约 1.9s，接收端起来只要约 0.5s。
+            // 先拉起发送端但不等它就绪，紧接着起接收端 —— 两段重叠，省掉那 0.5s。
+            // 顺序不能反：VdSend 真正开始发帧是在 capture ready 之后，那时接收端早已 listen，
+            // 所以不会出现「连不上被拒」的 send FAIL。
+            launchSender();
             int alive = startReceiver();
             lastStartHealth.receiver = alive;
             log.print("  接收端进程: " + alive + "（应为 1）");
@@ -429,8 +435,8 @@ public final class VdCtl {
                                 + "点顶栏「一键清理」后再启动；否则确认仪表已开机");
             }
 
-            if (step(6, 8, "起车机发送端（shell 域，mode=" + cfg.mode + "，" + cfg.fps + " fps）")) return false;
-            startSender();
+            if (step(6, 8, "等车机发送端就绪（capture ready，mode=" + cfg.mode + "，" + cfg.fps + " fps）")) return false;
+            awaitSenderReady();
 
             if (step(7, 8, "等端到端出帧（轮询，出帧就往下走）")) return false;
             log.print("  --- 仪表：接收/合成 ---");
@@ -713,10 +719,9 @@ public final class VdCtl {
                         + "（界面上现在填的是 " + cfg.pkg + "，不参与收尾）");
             }
             if (step(1, 4, "停车机发送端")) return false;
-            // killvds stop 里有固定 sleep 2 等虚拟屏销毁 + restore 进程，实测 4.3s，
-            // 这一步是退出预算里最贵的一段（B5 才动它）
-            String out = adb.exec("sh " + KILLVDS + " stop " + pkg
-                    + "; rm -f /data/local/tmp/vdcap", 45000);
+            // B5-B：这一步历史上会偶发卡到 adb 的 45s 读超时（前台跑的 app_process --restore 等不到退出）。
+            // 15s 上限 + kill -9 兜底，宁可留红灯也不让用户盯着转圈 45 秒。
+            String out = killSender(pkg);
             for (String line : tail(out, 8).split("\n")) {
                 if (!line.trim().isEmpty()) log.print("     " + line.trim());
             }
@@ -1244,20 +1249,115 @@ public final class VdCtl {
         return "PAT=" + a + "; PAT=${PAT}" + b + "; ";
     }
 
-    private void startSender() throws IOException {
+    /**
+     * 只把 VdSend 拉起来，**不等 capture ready**（B5-C：和起接收端并行）。
+     *
+     * 用 `& echo LAUNCHED` 立刻返回；进程靠 setsid 脱离 shell，shell 退出不影响它。
+     */
+    private void launchSender() throws IOException {
         String cmd = "CLASSPATH=" + DEX + " setsid app_process /system/bin com.probe.asx.VdSend "
                 + "--child --mode " + cfg.mode + " --pkg " + cfg.pkg + " "
                 + cfg.outW + " " + cfg.outH + " " + cfg.fps
                 + (cfg.previewPort > 0 ? " --preview " + cfg.previewPort : "")
-                + " > " + VDSEND_LOG + " 2>&1 & "
-                // 以前这里 sleep 10 硬等。现在以 capture ready 为准（实测 1~1.5 秒），
-                // 出了就走；第一行 fps= 是 2 秒时才打的，留给 [7/8] 再取。
-                + "i=0; while [ $i -lt 75 ]; do grep -qE 'capture ready|FAIL' " + VDSEND_LOG
+                + " > " + VDSEND_LOG + " 2>&1 & echo LAUNCHED; sleep 0.5";
+        // 末尾那个 sleep 不是凑数：Adb 客户端读到 __RC 哨兵就关 socket，adbd 随之收掉这个会话的
+        // 进程组；而 toybox 的 setsid 要 fork 一次才真正 detach —— 会话先关、setsid 还没跑完，
+        // VdSend 就会被一起带走（实测 18:04 那次 vdsend.log 是空的）。
+        // 留 0.5s 给 setsid 完成 detach；这 0.5s 里发送端已经在初始化，不浪费。
+        String out = adb.exec(cmd, 15000).trim();
+        if (!out.contains("LAUNCHED")) log.print("  !! 发送端没拉起来：" + oneLine(out));
+    }
+
+    /** 等 VdSend 打出 capture ready（0.2s 一轮，上限 15s），再把日志尾巴打出来 */
+    private void awaitSenderReady() throws IOException {
+        String cmd = "i=0; while [ $i -lt 75 ]; do grep -qE 'capture ready|FAIL' " + VDSEND_LOG
                 + " && break; i=$((i+1)); sleep 0.2; done; "
                 + "grep -E 'child start|VD created|target task|launching target|moved to display|"
                 + "shadow display ready|capture ready|args crop|FAIL|fps=' " + VDSEND_LOG + " | tail -6";
         logIndented(adb.exec(cmd, 25000));
     }
+
+    /**
+     * 停车机发送端（B5-B）：给「可能卡死」的那一步一个确定的预算。
+     *
+     * <p>killvds.sh 的最后一步是在前台跑 `app_process --restore` 等它退出；
+     * 2026-11-05 17:53 / 17:54 各卡死一次，直到 adb 的 45s 读超时才返回 ——
+     * 用户看到的是「点了停止没反应」。这里把预算压到 15s，超时就 kill -9 残留再补一发（8s）。
+     *
+     * <p>两次都超时返回空串，让调用方按「残留未清」报红灯 —— 绝不假装收尾成功。
+     */
+    private String killSender(String pkg) {
+        String cmd = "sh " + KILLVDS + " stop " + pkg + "; rm -f /data/local/tmp/vdcap";
+        try {
+            return adb.exec(cmd, STOP_SENDER_MS);
+        } catch (Throwable t) {
+            log.print("     !! 停发送端超过 " + STOP_SENDER_MS + "ms：" + brief(t));
+            // 读超时会把这条 adb 连接弄死：不重连的话，后面的 kill -9、二次 stop、残留检查
+            // 全都会报「未连接」，整个收尾直接中断（2026-11-05 18:13 注入测试实测就是这条路径）。
+            if (!reconnectQuietly()) {
+                log.print("     !! 重连失败：本次收尾不能确认，请再点一次「停止」");
+                return "";
+            }
+        }
+        try {
+            String k = adb.exec(FORCE_KILL, 10000).trim();
+            log.print("     补一刀 kill -9：" + (k.isEmpty() ? "(无残留)" : oneLine(k)));
+        } catch (Throwable t) {
+            log.print("     !! kill -9 也失败：" + brief(t));
+        }
+        try {
+            String out = adb.exec(cmd, STOP_SENDER_RETRY_MS);
+            log.print("     再补一次 stop（上限 " + STOP_SENDER_RETRY_MS + "ms）");
+            return out;
+        } catch (Throwable t) {
+            log.print("     !! 二次 stop 仍超时：继续往下走，靠「确认恢复」给结论");
+            return "";
+        }
+    }
+
+    /** B5-B：停发送端的单次预算（原 45s 一次卡死就吃掉整个退出预算） */
+    private static final int STOP_SENDER_MS = 15000;    /** B5-B：超时后补一次的上限 */
+    private static final int STOP_SENDER_RETRY_MS = 8000;
+
+    /**
+     * 读超时后重连。
+     *
+     * <p>Adb 的读超时会把 socket 置成断开状态，之后任何 exec 都直接抛「未连接」。
+     * 收尾链路里超时是**可以被预期的**（restore 会偶发卡死），所以必须能自己接回来：
+     * 从 {@code adb.endpoint}（形如 127.0.0.1:5050）里取地址重连，认证走已有 key，一般 1 秒内完成。
+     */
+    private boolean reconnectQuietly() {
+        try {
+            adb.close();
+            String ep = adb.endpoint;
+            String host = "127.0.0.1";
+            int port = 5050;
+            if (ep != null && ep.lastIndexOf(':') > 0) {
+                host = ep.substring(0, ep.lastIndexOf(':'));
+                int p = parseInt(ep.substring(ep.lastIndexOf(':') + 1));
+                if (p > 0) port = p;
+            }
+            boolean ok = adb.connect(host, port, 8);
+            log.print("     重连 " + host + ":" + port + (ok ? " 成功" : " 失败"));
+            return ok;
+        } catch (Throwable t) {
+            log.print("     重连异常：" + brief(t));
+            return false;
+        }
+    }
+
+    /**
+     * 兜底强杀：只杀 cmdline 以 app_process 开头的 VdSend 实例。
+     *
+     * 这里的匹配串和 killvds.sh 一样要防「把自己也杀了」—— 本命令的 shell 是 `sh -c ...`，
+     * cmdline 不以 app_process 开头，所以 case 判断天然排除它。
+     */
+    private static final String FORCE_KILL =
+            "PAT=com.probe.asx.VdSend; "
+                    + "for p in $(ps -A -o PID,ARGS 2>/dev/null | grep -F \"$PAT\" | awk '{print $1}'); do "
+                    + "c=$(cat /proc/$p/cmdline 2>/dev/null | tr '\\0' ' '); "
+                    + "case \"$c\" in app_process*) kill -9 $p 2>/dev/null && echo \"killed $p\";; esac; "
+                    + "done; true";
 
     // ============================================================ 目标应用
 
