@@ -18,7 +18,65 @@ import java.util.Locale;
  */
 public final class VdCtl {
 
-    public interface Log { void print(String s); }
+    public interface Log {
+        void print(String s);
+        /**
+         * 进度上报（UI-12）。默认空实现，老调用方不用改。
+         *
+         * @param step  第几步（从 0 开始，8 步流程时最大 8）
+         * @param total 总共几步
+         * @param what  这一步在干什么，可直接显示在进度条旁边
+         */
+        default void progress(int step, int total, String what) { }
+    }
+
+    /** 当前进度（默认 0/0 = 没在跑），供面板轮询 */
+    private volatile int progStep;
+    private volatile int progTotal;
+    private volatile String progWhat = "";
+
+    public int progStep() { return progStep; }
+    public int progTotal() { return progTotal; }
+    public String progWhat() { return progWhat; }
+
+    /**
+     * 中断标志（UI-12）：设了之后，**下一步开始前**就退出。
+     *
+     * 正在跑的那条 adb 命令没法打断（killvds stop 最长 4.4s），所以中断粒度是「步」而不是「毫秒」。
+     * 这一点如实写在面板上：点「中断」后会说「等当前这一步结束」。
+     */
+    private volatile boolean cancelled;
+
+    public void cancel() { cancelled = true; }
+
+    public void clearCancel() { cancelled = false; }
+
+    /** 打一步的标题并上报进度；返回 true 表示已被要求中断 */
+    private boolean step(int n, int total, String what) {
+        if (cancelled) {
+            log.print("已中断（停在第 " + progStep + " 步，后续步骤跳过）");
+            // 中断点如果在 [5/8] 之后，两端进程其实已经起来了 —— 不提示的话
+            // 用户会以为「没启动成功」，然后直接退出，把两个进程留在车上
+            if (progStep >= 5) {
+                log.print("   已经起来的发送端/接收端不会自动回收：点「停止」收尾");
+            }
+            log.progress(progStep, total, "已中断");
+            return true;
+        }
+        progStep = n;
+        progTotal = total;
+        progWhat = what;
+        log.progress(n, total, what);
+        log.print("[" + n + "/" + total + "] " + what);
+        return false;
+    }
+
+    private void progressDone() {
+        progStep = 0;
+        progTotal = 0;
+        progWhat = "";
+        log.progress(0, 0, "");
+    }
 
     // ============================================================ 投屏区口径
 
@@ -264,22 +322,41 @@ public final class VdCtl {
 
     // ============================================================ 启动
 
+    /**
+     * 启动失败的统一出口（UX-06）：停在具体第几步、为什么、下一步点什么。
+     *
+     * 以前各步失败只打一行 `!!`，用户看完还是不知道该动哪里 —— 尤其「目标应用没有窗口」
+     * 和「仪表端没响应」这两类，修复动作完全不同却都表现为一句报错。
+     *
+     * @param step 第几步（对应的 [n/8] 编号）
+     * @param what 这一步出了什么事
+     * @param next 下一步该做什么
+     */
+    private boolean fail(int step, String what, String next) {
+        log.print("!! 停在 [" + step + "/8]：" + what);
+        log.print("   下一步：" + next);
+        return false;
+    }
+
     public boolean start() {
         try {
             // 自定义仪表区域 / 满宽横带都先规范化：夹到 1920x720 内，并让发送尺寸
             // 跟矩形严格一致，否则仪表端要拉伸，画面会扁/拉长（UX-15）。
             cfg.normalize();
+            // 上一次按过「中断」不能影响这一次；进度也要归零重算
+            cancelled = false;
+            progressDone();
             // 投出去的就是这一刻的 pkg，之前/之后界面上再改都与本次投屏无关
             activePkg = cfg.pkg;
             // 顺手把这一轮已经采到的数据填成健康快照：面板上的三层小灯直接用它，
             // 不用再额外跑一次 health()（那要 2 秒，会把「启动到出画面」拖长）
             lastStartHealth = new Health();
             lastStartHealth.adbOk = true;
-            log.print("[0/8] 检查车机 adb（" + adb.endpoint + "）");
+            if (step(0, 8, "检查车机 adb（" + adb.endpoint + "）")) return false;
             String ok = adb.exec("echo car_ok", 8000);
             if (!ok.contains("car_ok")) {
-                log.print("!! 车机无响应：adbd 没开 / 端口不通 / 不在同一网络");
-                return false;
+                return fail(0, "车机 adb 不通（" + adb.endpoint + "）",
+                        "确认车机在开机、adb 端口没变、手机/PC 与车机同网段；改「高级 → 端口」后可重试");
             }
             log.print("  ok (mode=" + cfg.mode + ", 目标=" + cfg.pkg + ", "
                     + cfg.outW + "x" + cfg.outH + ", " + cfg.fps + "fps)");
@@ -294,13 +371,16 @@ public final class VdCtl {
                 log.print("  裁切 " + cfg.crop + " 已写入 " + "/data/local/tmp/vdcrop.txt");
             }
 
-            log.print("[1/8] 推发送端 dex + 杀进程脚本");
-            if (!pushDex()) return false;
+            if (step(1, 8, "推发送端 dex + 杀进程脚本")) return false;
+            if (!pushDex()) {
+                return fail(1, "发送端 dex 推送失败",
+                        "看上面的大小比对；多半是 /data/local/tmp 写不进，重连 adb 后重试");
+            }
             adb.push(readAssetKillvds(), KILLVDS, Adb.MODE_EXEC, 20000);
             adb.exec("chmod 755 " + KILLVDS + "; rm -f /data/local/tmp/vdcap", 10000);
             log.print("  " + DEX + " (" + dexSize + " B)");
 
-            log.print("[2/8] 停旧发送端（先 TERM 让 vd 模式把窗口搬回去）");
+            if (step(2, 8, "停旧发送端（先 TERM 让 vd 模式把窗口搬回去）")) return false;
             String out = adb.exec("sh " + KILLVDS + " stop " + cfg.pkg, 45000);
             for (String line : tail(out, 3).split("\n")) {
                 if (!line.trim().isEmpty()) log.print("  " + line.trim());
@@ -309,25 +389,41 @@ public final class VdCtl {
             // 必须放在起发送端之前：VdSend 的 vd 模式一上来就要找目标窗口，
             // 找不到会直接抛异常退出（表现就是「投出来的是主屏/控制台自己」）。
             if ("vd".equals(cfg.mode)) {
-                log.print("[3/8] 确保目标应用有窗口：" + cfg.pkg);
-                if (!ensureTargetApp()) return false;
+                if (step(3, 8, "确保目标应用有窗口：" + cfg.pkg)) return false;
+                if (!ensureTargetApp()) {
+                    return fail(3, "目标应用没有可用窗口：" + cfg.pkg,
+                            "确认它已安装、并且手动打开过一次（有的车机应用不允许后台拉起）；"
+                                    + "或点「目标应用 → 更换」换一个可投的");
+                }
             }
 
-            log.print("[4/8] 确保仪表端 " + ICBIN);
-            if (!ensureClusterBinary()) return false;
+            if (step(4, 8, "确保仪表端 " + ICBIN)) return false;
+            if (!ensureClusterBinary()) {
+                return fail(4, "仪表端程序投送失败",
+                        "确认仪表已开机、30510 端口在听；仪表重启后 /tmp 会被清空，需要重投一次。"
+                                + "可在「高级 → 自检」看仪表侧是否可达");
+            }
 
-            log.print("[5/8] 起仪表接收端（投屏区 "
+            if (step(5, 8, "起仪表接收端（投屏区 "
                     + (cfg.cCustom ? cfg.cX + "," + cfg.cY + " " + cfg.cW + "x" + cfg.cH
                                    : "满宽横带 y=" + cfg.top + ".." + (720 - cfg.bot))
-                    + "）");
+                    + "）")) return false;
             int alive = startReceiver();
             lastStartHealth.receiver = alive;
             log.print("  接收端进程: " + alive + "（应为 1）");
+            if (alive <= 0) {
+                // 多半是端口被上一次没退干净的接收端占着（/tmp/icrecv.log 里会有 listen: 错误）
+                String tailLog = Icrpc.run(adb, "tail -3 /tmp/icrecv.log 2>/dev/null", 4, 30000);
+                logIndented(tailLog);
+                return fail(5, "仪表接收端没起来（进程 0）",
+                        "看上面 icrecv.log 末尾：出现 listen/Address already in use 就是端口被占，"
+                                + "点顶栏「一键清理」后再启动；否则确认仪表已开机");
+            }
 
-            log.print("[6/8] 起车机发送端（shell 域，mode=" + cfg.mode + "，" + cfg.fps + " fps）");
+            if (step(6, 8, "起车机发送端（shell 域，mode=" + cfg.mode + "，" + cfg.fps + " fps）")) return false;
             startSender();
 
-            log.print("[7/8] 等端到端出帧（轮询，出帧就往下走）");
+            if (step(7, 8, "等端到端出帧（轮询，出帧就往下走）")) return false;
             log.print("  --- 仪表：接收/合成 ---");
             // 仪表侧也轮询：日志里出现 frames= 就说明真的收到帧了，不用再干等。
             // 上限 5 秒，超了照样往下走（真没帧的话 [8/8] 会报出来）。
@@ -337,12 +433,14 @@ public final class VdCtl {
                     + "grep -E 'frames=|LISTEN|VISIBLE|DST ' /tmp/icrecv.log | tail -3", 8, 45000);
             logIndented(icOut);
             lastStartHealth.icFps = maxOf(lastStartHealth.icFps, num(icOut, "(\\d+(?:\\.\\d+)?)fps"));
+            // 收端没出帧 / 也没打印监听与几何，说明画面根本没到仪表
+            boolean gotFrames = icOut.contains("frames=") || icOut.contains("VISIBLE");
             log.print("  --- 车机：采集/发送 ---");
             String carOut = adb.exec("grep 'fps=' " + VDSEND_LOG + " | tail -2", 10000);
             logIndented(carOut);
             lastStartHealth.carFps = maxOf(lastStartHealth.carFps, num(carOut, "fps=(\\d+(?:\\.\\d+)?)"));
 
-            log.print("[8/8] 健康检查");
+            if (step(8, 8, "健康检查")) return false;
             // 两件小事合成一次往返：异常计数 + 发送端存活数
             // （grep -c 在 0 匹配时退出码是 1，所以不能写 `|| echo 0`，那会多打一行）
             String[] hc = adb.exec("echo BAD=$(grep -cE 'capture null|SF capture degraded|send FAIL' "
@@ -370,6 +468,14 @@ public final class VdCtl {
             if (proc.startsWith("0") || proc.isEmpty()) {
                 log.print("!! 发送端已退出，最后几行日志：");
                 logIndented(adb.exec("tail -6 " + VDSEND_LOG, 10000));
+                return fail(8, "车机发送端起来后立刻退出了",
+                        "看上面 tail 的报错：目标应用无窗口 / 虚拟屏创建失败 / capture 被拒。"
+                                + "最常见是目标应用在启动瞬间退出了，换一个应用重试");
+            }
+            if (!gotFrames) {
+                // 进程都在但仪表没收到帧：链路断在中间，这时候说「就绪」就是在骗人
+                log.print("!! 两端进程都在，但仪表 5 秒内没收到任何一帧");
+                log.print("   下一步：点「停止」收尾后重来；反复出现就查仪表 5560 端口是否可达");
                 return false;
             }
             log.print("");
@@ -377,7 +483,191 @@ public final class VdCtl {
             return true;
         } catch (Throwable t) {
             log.print("!! 启动中断: " + brief(t));
+            log.print("   下一步：点「停止」把两端收干净再重试");
             return false;
+        } finally {
+            progressDone();
+        }
+    }
+
+    // ============================================================ 启动自检（UX-04）
+
+    /**
+     * 上一轮是否正常结束的取证结果。
+     *
+     * 关车/断电后重进，界面上看不出上一次留了什么 —— 而残留物恰恰是「第一次启动
+     * 就莫名其妙失败」的主因：旧发送端占着虚拟屏、旧接收端占着端口、以及最危险的
+     * 一种：**仪表进程没了但 fb1 没恢复，仪表就停在最后一帧投屏画面上**。
+     */
+    public static final class Residue {
+        /** adb 通道是否活 */
+        public boolean adbOk;
+        /** 车机发送端进程数；-1 = 没测出来 */
+        public int sender = -1;
+        /** 车机上 asxvd 虚拟屏个数；-1 = 没测出来 */
+        public int vdDisplay = -1;
+        /** 仪表接收端进程数；-1 = 没测出来 */
+        public int receiver = -1;
+        /** /tmp/icrecv.log 最后一条有效记录（出帧行或 RESTORE 行） */
+        public String lastLine = "";
+        /** 仪表可能停在投屏画面上（进程没了，但最后一条记录是出帧） */
+        public boolean stuck;
+        public long costMs;
+
+        /** 有进程级残留 */
+        public boolean hasProc() { return sender > 0 || receiver > 0 || vdDisplay > 0; }
+
+        /** 需要用户处理 */
+        public boolean dirty() { return hasProc() || stuck; }
+
+        /** 顶部横幅文案 */
+        public String bannerText() {
+            StringBuilder sb = new StringBuilder("检测到上次未正常结束：");
+            boolean first = true;
+            if (sender > 0) {
+                sb.append("车机发送端 ").append(sender).append(" 个");
+                first = false;
+            }
+            if (vdDisplay > 0) {
+                if (!first) sb.append("、");
+                sb.append("虚拟屏 ").append(vdDisplay).append(" 个");
+                first = false;
+            }
+            if (receiver > 0) {
+                if (!first) sb.append("、");
+                sb.append("仪表接收端 ").append(receiver).append(" 个");
+                first = false;
+            }
+            if (stuck) {
+                if (!first) sb.append("、");
+                sb.append("仪表可能停在投屏画面上");
+                first = false;
+            }
+            if (first) return "";
+            return sb.append("。清理后可正常启动。").toString();
+        }
+    }
+
+    /**
+     * 启动自检（UX-04）：一次 exec 拿车机侧，一次 RPC 拿仪表侧，成本同 {@link #health()}。
+     *
+     * 四项判据：`killvds check` 的发送端数、`dumpsys display` 的 asxvd 计数、
+     * 仪表 `ps icrecv_dbg`、`/tmp/icrecv.log` 的最后一条记录是不是 RESTORE。
+     *
+     * 第四项是关键：「进程没了」不等于「画面回来了」。进程被 SIGKILL 时不会写回
+     * fb1，仪表会一直停在最后一帧；这时只有看日志最后一条是出帧还是 RESTORE 才判得出来。
+     */
+    public Residue scanResidue() {
+        Residue r = new Residue();
+        long t0 = System.currentTimeMillis();
+        try {
+            String car = adb.exec("echo SB; echo PROC=$(sh " + KILLVDS + " check 2>/dev/null); "
+                    + "echo VD=$(dumpsys display 2>/dev/null | grep -c 'DisplayDeviceInfo{\"asxvd');",
+                    20000);
+            r.adbOk = car.contains("SB");
+            for (String line : car.split("\n")) {
+                String t = line.replace("\r", "").trim();
+                int q = t.indexOf("PROC=");
+                if (q >= 0) { r.sender = parseInt(numText(t, q + 5)); continue; }
+                q = t.indexOf("VD=");
+                if (q >= 0) r.vdDisplay = parseInt(numText(t, q + 3));
+            }
+            if (!r.adbOk) {
+                r.costMs = System.currentTimeMillis() - t0;
+                return r;
+            }
+
+            // 进程数仍用「拆串防自命中」：执行这条命令的 shell 自己命令行里就有
+            // icrecv_dbg，不拆开永远多数出 1 个。
+            String pattern = splitPattern("icrecv_", "dbg");
+            String ic = Icrpc.run(adb, pattern
+                    + "echo RECV=$(ps -o pid,args | grep -F \"$PAT\" | grep -v grep | wc -l); "
+                    + "grep -E 'frames=|RESTORE' /tmp/icrecv.log 2>/dev/null | tail -1", 5, 40000);
+            for (String line : ic.split("\n")) {
+                String t = line.replace("\r", "").trim();
+                if (t.isEmpty()) continue;
+                int q = t.indexOf("RECV=");
+                if (q >= 0) { r.receiver = parseInt(numText(t, q + 5)); continue; }
+                if (t.contains("frames=") || t.contains("RESTORE")) r.lastLine = t;
+            }
+            if (r.receiver < 0) r.receiver = 0;
+            // 仪表没进程、而日志停在一条出帧记录上 → 上一轮是被硬杀的，fb1 没写回
+            r.stuck = r.receiver <= 0 && !r.lastLine.isEmpty() && r.lastLine.contains("frames=");
+        } catch (Throwable t) {
+            log.print("!! 启动自检中断: " + brief(t));
+        }
+        r.costMs = System.currentTimeMillis() - t0;
+        return r;
+    }
+
+    /**
+     * 一键清理上一轮残留（UX-04）。
+     *
+     * 只清「进程 + 虚拟屏 + 一次性临时文件」，**保留** vd.dex 与 /tmp/icrecv_dbg ——
+     * 那两样是已投送产物，删了下次启动要多等 10~30s 重推（C-1 定案）。
+     *
+     * @param deadlineAt 截止时间戳；0 = 不限
+     */
+    public boolean cleanupResidue(long deadlineAt) {
+        long t0 = System.currentTimeMillis();
+        // 同 stop()：清理也不许被中断标志跳过
+        cancelled = false;
+        progressDone();
+        boolean carOk = true;
+        boolean restoreOk = true;
+        String pkg = activePkg.isEmpty() ? cfg.pkg : activePkg;
+        try {
+            if (step(1, 3, "停车机发送端 + 销毁虚拟屏")) return false;
+            String out = adb.exec("sh " + KILLVDS + " stop " + pkg
+                    + "; rm -f /data/local/tmp/vdcap", 45000);
+            for (String line : tail(out, 4).split("\n")) {
+                if (!line.trim().isEmpty()) log.print("     " + line.trim());
+            }
+            int left = parseInt(lastLine(adb.exec("sh " + KILLVDS + " check", 15000).trim()));
+            log.print("     残留进程: " + left + (left == 0 ? "  [OK]" : "  [未清空]"));
+            carOk = left == 0;
+
+            if (step(2, 3, "停仪表接收端（SIGTERM -> restore）")) return false;
+            int alive = stopReceiver();
+            log.print("     残留进程: " + alive);
+            if (overBudget(deadlineAt)) {
+                log.print("     !! 预算用尽，跳过恢复确认");
+                restoreOk = false;
+            } else {
+                // 仪表本来就没进程也要看日志：被 SIGKILL 的那种情况进程早没了，
+                // 但画面还留在仪表上，只有最后一条记录能区分「恢复过」和「停在画面」
+                String last = Icrpc.run(adb,
+                        "grep -E 'frames=|RESTORE' /tmp/icrecv.log 2>/dev/null | tail -1", 6, 40000).trim();
+                if (alive > 0 || last.contains("frames=")) {
+                    restoreOk = confirmRestore();
+                    if (!restoreOk && !overBudget(deadlineAt)) {
+                        log.print("     未看到恢复标记，补一次收尾并复查");
+                        stopReceiver();
+                        restoreOk = confirmRestore();
+                    }
+                } else {
+                    log.print("     仪表侧本来就已恢复，无需处理");
+                }
+                if (!restoreOk) {
+                    log.print("  !! 仪表未确认恢复：可能停在投屏画面上");
+                    log.print("     处理：再点一次「清理」，或断电重启仪表；日志在仪表 /tmp/icrecv.log");
+                }
+            }
+            receiverRestored = restoreOk;
+
+            if (step(3, 3, "清临时文件（保留 vd.dex 与 /tmp/icrecv_dbg）")) return false;
+            int tempLeft = cleanupTemp();
+            log.print("     剩余 /data/local/tmp/.adbprobe_*: " + tempLeft);
+
+            boolean ok = carOk && restoreOk;
+            log.print(ok ? "清理完成，用时 " + (System.currentTimeMillis() - t0) + " ms"
+                         : "清理未完成，用时 " + (System.currentTimeMillis() - t0) + " ms");
+            return ok;
+        } catch (Throwable t) {
+            log.print("!! 清理中断: " + brief(t));
+            return false;
+        } finally {
+            progressDone();
         }
     }
 
@@ -398,6 +688,10 @@ public final class VdCtl {
      */
     public boolean stop(long deadlineAt) {
         long t0 = System.currentTimeMillis();
+        // 收尾绝不允许被「中断」跳过：启动时按过中断，cancelled 会一直是 true，
+        // 那样 step(1,4) 会直接返回 —— 车机进程和仪表画面就留着了。这里强制清掉。
+        cancelled = false;
+        progressDone();
         boolean carOk = false;
         // 没起过接收端时仪表本来就没被改动，天然算恢复好了；只有起过才要求看到恢复标记
         boolean restoreOk = true;
@@ -409,7 +703,7 @@ public final class VdCtl {
                 log.print("  恢复目标用本次实际投出的应用：" + pkg
                         + "（界面上现在填的是 " + cfg.pkg + "，不参与收尾）");
             }
-            log.print("[1/4] 停车机发送端");
+            if (step(1, 4, "停车机发送端")) return false;
             // killvds stop 里有固定 sleep 2 等虚拟屏销毁 + restore 进程，实测 4.3s，
             // 这一步是退出预算里最贵的一段（B5 才动它）
             String out = adb.exec("sh " + KILLVDS + " stop " + pkg
@@ -426,11 +720,11 @@ public final class VdCtl {
             log.print("     残留虚拟屏: " + oneLine(adb.exec(
                     "dumpsys display | grep -c 'DisplayDeviceInfo{\"asxvd'", 15000)));
 
-            log.print("[2/4] 停仪表接收端（SIGTERM -> restore）");
+            if (step(2, 4, "停仪表接收端（SIGTERM -> restore）")) return false;
             int alive = stopReceiver();
             log.print("     残留进程: " + alive);
 
-            log.print("[3/4] 确认仪表已恢复原版面");
+            if (step(3, 4, "确认仪表已恢复原版面")) return false;
             if (!receiverEverStarted) {
                 log.print("     本次没起过仪表接收端，fb1 未被改动，无需恢复");
             } else if (overBudget(deadlineAt)) {
@@ -452,7 +746,7 @@ public final class VdCtl {
             if (restoreOk) receiverEverStarted = false;
             receiverRestored = restoreOk;
 
-            log.print("[4/4] 结论");
+            if (step(4, 4, "结论")) return false;
             boolean ok = carOk && restoreOk;
             if (ok) {
                 log.print("  收尾完成，用时 " + (System.currentTimeMillis() - t0) + " ms");
@@ -477,6 +771,8 @@ public final class VdCtl {
             log.print("!! 停止中断: " + brief(t));
             receiverRestored = false;
             return false;
+        } finally {
+            progressDone();
         }
     }
 
@@ -1047,8 +1343,9 @@ public final class VdCtl {
                 return true;
             }
         }
-        log.print("!! 起不来。可能：包名写错 / 该应用没有桌面入口 / 被系统禁止启动");
-        log.print("   可先点「选择应用」，从运行中的任务里挑一个再试");
+        // 不在这里打 `!!`：调用方 start() 会经 fail() 统一打「停在哪 + 下一步」，
+        // 两处都打红字会连着两条，看着像两个独立故障
+        log.print("  起不来。可能：包名写错 / 该应用没有桌面入口 / 被系统禁止启动");
         return false;
     }
 

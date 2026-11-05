@@ -66,6 +66,8 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
     private Button advHead;
     /** 三层小灯右侧的「刷新」 */
     private Button btnHealth;
+    /** 高级里的「连接」：UI-12 要求它跟其他按钮一样受 busy 管控 */
+    private Button btnConnect;
     /** 日志行的「诊断」按钮 */
     private Button btnDiag;
     /** 仪表区域「复位」：一键回到安全区默认值 */
@@ -106,6 +108,9 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         setBusy(false);
         showGuideIfNeeded();
         handleIntent(getIntent());
+        // 首屏先自检一次上次有没有留下东西（UX-04）。放在 handleIntent 之后：
+        // 遥控来的 act 优先，别让 2 秒的自检挡住 PC 侧的自动化。
+        if (getIntent() == null || getIntent().getStringExtra("act") == null) checkResidue();
     }
 
     @Override
@@ -163,6 +168,16 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
             case "main":    run(() -> startWith("main")); break;
             case "stop":    run(this::stopCasting); break;
             case "health":  run(this::refreshHealth); break;
+            // UX-04：启动自检 / 一键清理（PC 侧自动化用，等价于点顶栏那条横幅）
+            case "residue": residueChecked = false; checkResidue(); break;
+            case "clean":   runOnUiThread(this::cleanResidue); break;
+            // UI-12 中断：粒度是「步」，正在跑的那条 adb 命令打断不了
+            case "cancel":  runOnUiThread(() -> {
+                if (ctl == null) return;
+                ctl.cancel();
+                print("已请求中断：等当前这一步跑完就停");
+            });
+                break;
             // 把关键控件的屏幕坐标打到日志：PC 侧 input tap 老是点偏时用来自校准
             case "coords":  runOnUiThread(this::dumpCoords); break;
             // 仪表区域复位到安全区（PC 侧自动化用，等价于点面板上的「复位」）
@@ -255,6 +270,21 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
     private int logTitleTaps;
     /** 最近一次健康探针结果，供「灯」和「面积提示」共用 */
     private volatile VdCtl.Health lastHealth;
+
+    // ---------- UX-04 启动自检 ----------
+    /** 顶栏下方的残留提示条：只在 IDLE 且确实脏的时候出现 */
+    private LinearLayout residueBar;
+    private TextView residueText;
+    private Button btnClean;
+    /** 最近一次自检结果，供「清理后复查」和遥控入口共用 */
+    private volatile VdCtl.Residue lastResidue;
+    /** 自检是否已经跑过一轮（避免每次刷新都重新探 2 秒） */
+    private boolean residueChecked;
+
+    // ---------- UI-12 进度条 ----------
+    private LinearLayout progRow;
+    private View progFill, progRest;
+    private TextView progLabel;
 
     // ---------- 顶部流程条 ----------
     // 顺序按「先定仪表投屏区、再按它的宽高比框车机画面」排：投屏区决定投出去多大，
@@ -363,8 +393,15 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         // 状态机可能落后于车机（比如车机重启了），「停止」永远留一条手动兜底的路。
         // 主 CTA 的可用性已经在上面按 phase 单独算过了，这里不再覆盖。
         if (btnStartMain != null) btnStartMain.setEnabled(hasPkg && !busy);
-        if (btnStop != null) btnStop.setEnabled(!busy);
+        if (btnStop != null) {
+            // 启动中这个键是「中断」，必须保持可点 —— busy 时一律置灰的话，
+            // 用户就只能干等 8 步跑完（UI-12 要的正是「能中断」）
+            boolean canAbort = phase == Phase.STARTING && ctl != null;
+            btnStop.setText(canAbort ? "中断" : "停止");
+            btnStop.setEnabled(canAbort || !busy);
+        }
         if (btnStatus != null) btnStatus.setEnabled(!busy);
+        if (btnConnect != null) btnConnect.setEnabled(!busy);
         if (btnCrop != null) btnCrop.setEnabled(!busy);
         if (btnProbe != null) btnProbe.setEnabled(!busy);
         if (btnPick != null) btnPick.setEnabled(!busy);
@@ -373,6 +410,9 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         if (btnReset != null) btnReset.setEnabled(!busy);
         if (btnPreview != null) btnPreview.setEnabled(!busy);
         if (btnExit != null) btnExit.setEnabled(!busy);
+        if (btnClean != null) btnClean.setEnabled(!busy);
+        // 自检横幅：phase 变了（开始投屏 / 收尾完成）要重新判一次该不该出现
+        paintResidue(lastResidue);
     }
 
     private void paintSteps(int cur) {
@@ -452,6 +492,26 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         lamps.addView(btnHealthLocal);
         root.addView(lamps);
 
+        // ---------- 上次残留提示（UX-04） ----------
+        // 只在「确实查到残留」时出现，正常情况整条不占位。之所以要一条显眼的横幅而不是
+        // 一行日志：残留的典型后果是「第一次启动莫名其妙失败」，用户不会去翻日志找原因。
+        residueBar = new LinearLayout(this);
+        residueBar.setOrientation(LinearLayout.HORIZONTAL);
+        residueBar.setGravity(Gravity.CENTER_VERTICAL);
+        residueBar.setBackgroundColor(0x33D29922);
+        residueBar.setPadding(dp(10), dp(6), dp(6), dp(6));
+        residueText = text("", 20, C_WARN);
+        residueText.setLineSpacing(dp(2), 1f);
+        residueBar.addView(residueText, weight());
+        btnClean = mkButton("一键清理");
+        btnClean.setOnClickListener(v -> run(this::cleanResidue));
+        LinearLayout.LayoutParams cleanLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        cleanLp.leftMargin = dp(8);
+        residueBar.addView(btnClean, cleanLp);
+        residueBar.setVisibility(View.GONE);
+        root.addView(residueBar);
+
         // ---------- 流程条（常驻，不随日志滚走） ----------
         HorizontalScrollView hs = new HorizontalScrollView(this);
         hs.setHorizontalScrollBarEnabled(false);
@@ -473,6 +533,32 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         // 先画一遍空态（refreshUi 会在 onCreate 里补齐真实状态）
         paintSteps(0);
+
+        // ---------- 进度条（UI-12） ----------
+        // 以前 busy 期间界面零反馈（relay 最长 55s），用户以为点错了就会反复点，
+        // 而每次点击都被 run() 丢掉。现在给一条「到第几步、在干什么」的实在进度。
+        progRow = new LinearLayout(this);
+        progRow.setOrientation(LinearLayout.VERTICAL);
+        progRow.setPadding(0, dp(3), 0, dp(3));
+
+        LinearLayout track = new LinearLayout(this);
+        track.setOrientation(LinearLayout.HORIZONTAL);
+        progFill = new View(this);
+        progFill.setBackground(round(C_ACCENT, 0, dp(3)));
+        progRest = new View(this);
+        LinearLayout.LayoutParams fp = new LinearLayout.LayoutParams(0, dp(5), 0.02f);
+        progFill.setLayoutParams(fp);
+        LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(0, dp(5), 0.98f);
+        progRest.setLayoutParams(rp);
+        track.addView(progFill);
+        track.addView(progRest);
+        progRow.addView(track);
+
+        progLabel = text("", 19, C_MUTED);
+        progLabel.setPadding(0, dp(3), 0, 0);
+        progRow.addView(progLabel);
+        progRow.setVisibility(View.GONE);
+        root.addView(progRow);
 
         LinearLayout body = new LinearLayout(this);
         body.setOrientation(LinearLayout.VERTICAL);
@@ -576,7 +662,7 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         advBody.addView(label("连接与诊断"));
         LinearLayout r6 = row();
         r6.setPadding(0, dp(2), dp(30), 0);
-        final Button btnConnect = mkButton("连接");
+        btnConnect = mkButton("连接");
         btnStatus = mkButton("状态");
         btnProbe = mkButton("自检");
         portEdit = input("5050");
@@ -678,7 +764,16 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         // 拿到 CTA 就是一条正常路径，不需要用户理解 vd / main 是什么（UI-04）。
         btnStartVd.setOnClickListener(v -> run(() -> startWith(lastMode)));
 
-        btnStop.setOnClickListener(v -> run(this::stopCasting));
+        btnStop.setOnClickListener(v -> {
+            // 启动过程中这个键是「中断」：中断粒度是「步」，正在跑的那条 adb 命令打断不了
+            if (phase == Phase.STARTING && ctl != null) {
+                ctl.cancel();
+                print("已请求中断：等当前这一步跑完就停（killvds stop 最长 4.4s）");
+                btnStop.setEnabled(false);
+                return;
+            }
+            run(this::stopCasting);
+        });
 
         btnStatus.setOnClickListener(v -> run(this::showStatus));
 
@@ -879,6 +974,99 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         if (n < 0) setDot(d, C_MUTED);
         else if (n > 0) setDot(d, C_OK);
         else setDot(d, casting ? C_DANGER : C_MUTED);
+    }
+
+    // ============================================================ UI-12 进度条
+
+    /**
+     * VdCtl 每进入一步就回调一次。
+     *
+     * 之所以走回调而不是解析日志文本：日志格式会变（加了时间戳前缀、中括号），
+     * 解析一崩进度条就永远停在第一格，而且崩了也没人发现。
+     */
+    @Override
+    public void progress(int step, int total, String what) {
+        runOnUiThread(() -> paintProgress(step, total, what));
+    }
+
+    private void paintProgress(int step, int total, String what) {
+        if (progRow == null) return;
+        if (total <= 0) {
+            progRow.setVisibility(View.GONE);
+            return;
+        }
+        progRow.setVisibility(View.VISIBLE);
+        float frac = Math.max(0.02f, Math.min(1f, step / (float) total));
+        LinearLayout.LayoutParams fp = (LinearLayout.LayoutParams) progFill.getLayoutParams();
+        fp.weight = frac;
+        progFill.setLayoutParams(fp);
+        LinearLayout.LayoutParams rp = (LinearLayout.LayoutParams) progRest.getLayoutParams();
+        rp.weight = Math.max(0.0001f, 1f - frac);
+        progRest.setLayoutParams(rp);
+        progLabel.setText("[" + step + "/" + total + "] " + what);
+    }
+
+    // ============================================================ UX-04 启动自检
+
+    /**
+     * 开机进面板先自检一次：上次是不是正常结束的。
+     *
+     * 只在未投屏时才有意义 —— 正在投屏时「有发送端进程、有虚拟屏、有接收端」全是正常的。
+     * 成本同 health()（约 1.5~2s），所以只跑一次，靠 {@link #residueChecked} 挡住重复触发。
+     */
+    private void checkResidue() {
+        if (residueChecked) return;
+        residueChecked = true;
+        run(() -> {
+            // 首屏 ctl 还是 null，必须先走一次 ensureCtl（它会连 adb 并把 ctl 建起来）。
+            // 之前只在 ctl != null 时做，结果首屏永远静默跳过 —— 自检等于没做。
+            if (!ensureCtl()) {
+                print("启动自检：连不上车机，跳过残留检查");
+                return;
+            }
+            VdCtl.Residue r = ctl.scanResidue();
+            lastResidue = r;
+            runOnUiThread(() -> paintResidue(r));
+            if (r.adbOk) {
+                print(r.dirty()
+                        ? "启动自检：发现上次残留 —— " + r.bannerText()
+                        : "启动自检：干净（无残留进程 / 无残留虚拟屏 / 仪表已恢复）");
+            } else {
+                print("启动自检：连不上车机，跳过残留检查");
+            }
+        });
+    }
+
+    /** 按自检结果决定横幅出不出现。投屏中/启动中不显示（那时的进程数都是正常的） */
+    private void paintResidue(VdCtl.Residue r) {
+        if (residueBar == null) return;
+        boolean idle = phase == Phase.IDLE || phase == Phase.CONNECTED;
+        if (r == null || !r.adbOk || !r.dirty() || !idle) {
+            residueBar.setVisibility(View.GONE);
+            return;
+        }
+        residueText.setText(r.bannerText());
+        residueBar.setVisibility(View.VISIBLE);
+        if (btnClean != null) btnClean.setEnabled(!busy);
+    }
+
+    /** 一键清理残留：停车机发送端 + 停仪表接收端 + 确认恢复 + 清临时文件 */
+    private void cleanResidue() {
+        if (busy) return;
+        // 别在这里先 setBusy(true)：run() 自己会置位，先置位会让它以为「上一条任务还在跑」
+        // 直接拒绝执行（踩过，表现为点了没反应）
+        run(() -> {
+            boolean ok = ctl != null && ctl.cleanupResidue(0);
+            // 清完再扫一遍：横幅该消失就消失，没清干净就留着并说明
+            final VdCtl.Residue after = ctl == null ? null : ctl.scanResidue();
+            lastResidue = after;
+            if (ok && after != null && !after.dirty()) {
+                print("残留已清理，可以正常启动");
+            } else if (!ok) {
+                print("!! 清理未完全成功，横幅仍显示剩余项；可再点一次或断电重启仪表");
+            }
+            runOnUiThread(() -> paintResidue(after));
+        });
     }
 
     private void setDot(TextView d, int color) {
@@ -1380,6 +1568,13 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         savePrefs();
         lastMode = mode;
         previewOpened = false;
+        // UX-06：上次的残留还挂着就提一句。不硬拦 —— [2/8] 本来就会先清车机侧，
+        // 硬拦反而让「明明能起来」的场景变成点了没反应。
+        VdCtl.Residue rr = lastResidue;
+        if (rr != null && rr.dirty()) {
+            print("提醒：上次残留未清（" + rr.bannerText() + "）");
+            print("      本次会先清车机侧；仪表侧清不掉就点顶栏「一键清理」");
+        }
         setPhase(Phase.STARTING);
         boolean ok = ctl.start();
         if (ok && !ctl.binMd5().isEmpty()) {
@@ -1402,6 +1597,15 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
             runOnUiThread(() -> paintHealth(h));
         }
         if (ok) nudgeCarFps();
+        else {
+            // 启动失败时 [3/8] 可能已经把目标应用拉到前台，面板被盖住 ——
+            // 错误信息和「下一步」全在面板上，看不见等于没说（UI-12/UX-06）。
+            // 注意这里是后台线程，直接执行；不能再走 run()，那会因 busy 被自己拒绝。
+            // 拉回前台是尽力而为，失败也不能再抛异常盖掉真正的报错。
+            try {
+                adb.exec("am start -n com.xiaopeng.vdcast/.MainActivity", 12000);
+            } catch (Exception ignore) { }
+        }
     }
 
     /**
@@ -1456,7 +1660,12 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
     // ------------------------------------------------------------ 任务
 
     private void run(Runnable r) {
-        if (busy) { print("（上一条任务还在跑）"); return; }
+        // UI-12：被丢弃的请求不能只写一行日志 —— 用户点完什么都没变就会反复点。
+        // 用 `!!` 让日志摘要变红并自动展开，视线范围内一定看得见。
+        if (busy) {
+            print("!! 上一条任务还在跑，这次的点击没执行（等它结束，或点「中断」）");
+            return;
+        }
         setBusy(true);
         worker.execute(() -> {
             try {
