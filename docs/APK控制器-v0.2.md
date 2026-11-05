@@ -1,5 +1,9 @@
 # APK 控制器 v0.2（AdbProbe → 控制面）
 
+> **包名已迁移（2026-11-05）**：APK 由 `com.probe.adbprobe` 改为 `com.xiaopeng.vdcast`，
+> 应用名改「仪表投屏」，新增 `res/mipmap-*` 图标。本文档保留当时的实测记录，
+> 下文出现的旧包名属于历史事实，不再回改；当前构建/部署请以 `README.md` 为准。
+
 一句话：**把 `tools/startcast.sh` / `stopcast.sh` / `status.sh` 的全部动作，连同仪表端接收程序，
 一起搬进一个 1.1MB 的 APK**，特权操作一律不自己干，交给 adbd 以 `u:r:shell:s0` 域执行。
 

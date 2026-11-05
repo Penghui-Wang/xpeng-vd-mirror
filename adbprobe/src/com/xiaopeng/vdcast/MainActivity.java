@@ -1,4 +1,4 @@
-package com.probe.adbprobe;
+package com.xiaopeng.vdcast;
 
 import android.app.Activity;
 import android.app.AlertDialog;
@@ -46,7 +46,7 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
     private static final String PKG_DEFAULT = "com.tencent.qqmusicpad";
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
-    private final SimpleDateFormat ts = new SimpleDateFormat("HH:mm:ss", Locale.US);
+    private final SimpleDateFormat ts = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
 
     private TextView logView;
     private ScrollView logScroll;
@@ -77,7 +77,7 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         step(2, sp.contains("crop"));
         step(3, sp.contains("crect"));
 
-        print("车机投屏控制台 v1.0");
+        print("仪表投屏 v2.0");
         print("流程：选应用 → 框选裁切 → 框选仪表区域 → 启动 vd");
         setState("待机", C_MUTED);
         setBusy(false);
@@ -93,7 +93,7 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
 
     /**
      * 遥控入口：PC 侧一句 am start 就能驱动，不用在车机屏上摸黑点按钮。
-     *   am start -n com.probe.adbprobe/.MainActivity --es act connect
+     *   am start -n com.xiaopeng.vdcast/.MainActivity --es act connect
      *   --es act vd|main|stop|status|probe|apps|snap   --es pkg <pkg>   --es crop x,y,w,h
      */
     private void handleIntent(Intent it) {
@@ -235,7 +235,7 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
 
         // ---------- 顶栏：标题 + 状态 ----------
         LinearLayout head = row();
-        TextView title = text("车机投屏 · 控制台", 34, C_TEXT);
+        TextView title = text("仪表投屏", 34, C_TEXT);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         head.addView(title);
         head.addView(spacer());
@@ -774,10 +774,17 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
             port = PORT_DEFAULT;
         }
         try {
+            // 先看有没有可导入的现成密钥：本 ROM 的 adbd 授权 prompt 是单槽位、且没有 UI 可消，
+            // 一次「新公钥」请求就可能把整台车机的授权槽位占死（审计答复 §2.1 / ADB-12）。
+            // 所以只要能在约定位置找到已授权的私钥，就绝不生成新的。
             File keyFile = new File(getFilesDir(), "adbkey.der");
+            if (!keyFile.exists()) importKeyIfPresent(keyFile);
             boolean[] created = new boolean[1];
             PrivateKey key = Adb.loadOrCreateKey(keyFile, created);
-            if (created[0]) print("已生成新的 RSA 密钥（首次连接需在车机上确认）");
+            if (created[0]) {
+                print("!! 已生成新的 RSA 密钥：本车机不会弹出授权窗，新 key 无法完成授权");
+                print("   请把已授权的 adbkey.der 放到 /data/local/tmp/vdcast_adbkey.der 后重开应用");
+            }
             adb.setKey(key);
 
             print("连接 127.0.0.1:" + port + " …");
@@ -793,6 +800,43 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         } catch (Throwable t) {
             print("!! 连接失败: " + t.getClass().getSimpleName() + ": " + t.getMessage());
             return false;
+        }
+    }
+
+    /**
+     * 首次运行时从约定位置导入一把「已经在本车 adb_keys 里」的私钥（PKCS#8 DER）。
+     *
+     * 为什么需要：包名一换，应用私有目录就是新的，adbkey.der 不存在 → 会生成新 key；
+     * 而本 ROM 的 adbd 只会把新 key 的授权请求丢进「单槽位且无 UI 可消」的 pending 里，
+     * 结果是这台车机再也无法完成任何新授权。宁可导入，也不要生成。
+     *
+     * 文件来源由维护者用 adb 推：
+     *   adb push adbkey.der /data/local/tmp/vdcast_adbkey.der
+     */
+    private void importKeyIfPresent(File dst) {
+        final String[] paths = {
+                "/data/local/tmp/vdcast_adbkey.der",
+                "/sdcard/Download/vdcast_adbkey.der",
+        };
+        for (String p : paths) {
+            try {
+                File src = new File(p);
+                if (!src.isFile() || src.length() < 100 || src.length() > 8192) continue;
+                byte[] der = new byte[(int) src.length()];
+                try (java.io.FileInputStream in = new java.io.FileInputStream(src)) {
+                    int off = 0, n;
+                    while (off < der.length && (n = in.read(der, off, der.length - off)) > 0) off += n;
+                    if (off != der.length) continue;
+                }
+                // 只接受能解析的 PKCS#8，脏文件直接跳过（避免写坏之后每次启动都失败）
+                java.security.KeyFactory.getInstance("RSA")
+                        .generatePrivate(new java.security.spec.PKCS8EncodedKeySpec(der));
+                try (FileOutputStream out = new FileOutputStream(dst)) {
+                    out.write(der);
+                }
+                print("已导入已有密钥：" + p + "（不生成新 key）");
+                return;
+            } catch (Throwable ignored) { }
         }
     }
 

@@ -1,4 +1,4 @@
-package com.probe.adbprobe;
+package com.xiaopeng.vdcast;
 
 import android.util.Base64;
 
@@ -93,6 +93,18 @@ public final class Adb {
     private static final String[] SIGN_MODES = {"raw", "SHA-1", "SHA-256"};
 
     private static final int REPUB_GAP_MS = 30_000;
+
+    /**
+     * 本进程内是否已经提交过公钥。
+     *
+     * 本车 ROM 的 adbd 授权 prompt 是**单槽位**，且有遗留 pending 时新请求被
+     * `prompt currently pending, skipping` 直接丢弃；该 pending 没有任何 UI 载体，
+     * 用户无处可点。也就是说「发一次新公钥」就可能把整台车机的授权槽位占死，
+     * 其他应用再也无法完成新授权（见 docs/审计-四类改造-答复与需求确认-v1.md §2.1 ADB-12）。
+     *
+     * 所以：正常路径只走签名；公钥最多提交一次，提交后仍无 CNXN 就放弃，不再重试。
+     */
+    private static boolean pubkeySubmitted;
 
     /** 命令结果：rc 只有在调用 execRc 时才有效（其余为 Integer.MIN_VALUE） */
     public static final class Res {
@@ -215,11 +227,16 @@ public final class Adb {
                         sigTry++;
                         continue;
                     }
+                    if (pubkeySubmitted) {
+                        log.print("!! 本进程已提交过公钥且未获授权，放弃重试（继续发会占死车机授权槽位）");
+                        return false;
+                    }
                     send(os, CMD_AUTH, AUTH_PUBKEY, 0, pubkeyPayload());
+                    pubkeySubmitted = true;
                     if (!asked) {
                         asked = true;
                         log.print("→ 三种签名都不被接受，改提交公钥：");
-                        log.print("   请在车机弹窗点「允许」，并勾选「一律允许」");
+                        log.print("   本车机不会弹出授权窗；若 8 秒内未通过，说明这把 key 未登记");
                     }
                 }
             }

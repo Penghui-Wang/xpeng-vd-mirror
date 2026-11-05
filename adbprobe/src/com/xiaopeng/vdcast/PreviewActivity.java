@@ -1,4 +1,4 @@
-package com.probe.adbprobe;
+package com.xiaopeng.vdcast;
 
 import android.app.Activity;
 import android.content.Intent;

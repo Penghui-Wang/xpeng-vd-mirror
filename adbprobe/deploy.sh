@@ -5,7 +5,7 @@
 set -u
 export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 HERE="$(cd "$(dirname "$0")" && pwd -W)"
-PKG=com.probe.adbprobe
+PKG=com.xiaopeng.vdcast
 
 A() { bash "$HERE/../tools/adb.sh" "$@"; }
 

@@ -79,7 +79,7 @@
 
 ```
 asx/                  车机端 dex 源码（VdSend 发送端 + 各阶段诊断类 VdCap*/VdTok*）
-adbprobe/             控制台 APK（面板 UI、裁切框选、RPC、预览，内置上面两端产物）
+adbprobe/             仪表投屏 APK（面板 UI、裁切框选、RPC、预览，内置两端产物）
 vdtest/               最小 captureDisplay 验证 APK
 tools/icrecv2/        仪表端接收程序（Go，交叉编译成 ARMv7 静态 ELF）
 tools/                运维脚本（起停、部署、安装、状态）
@@ -94,25 +94,25 @@ shots/                现场截图
 ## 4. 构建
 
 ```bash
-# 车机端 dex
+# 车机端 dex（改了 asx/ 源码才需要）
 bash asx/build.sh                  # -> asx/build/dex/classes.dex
 
 # 仪表端接收程序
 bash tools/icrecv2/build.sh        # -> tools/icrecv2/icrecv_dbg（ELF32 ARM，纯静态）
 
-# 控制台 APK（会先重编接收端与 dex，再打进 assets）
-bash asx/build.sh && bash adbprobe/build.sh
+# 仪表投屏 APK（manifest + res 图标 + 注入 dex）
+bash adbprobe/build.sh             # 自动取 asx 产物；没有则沿用 assets/vd.dex
 ```
 
 依赖：JDK 17 + Android SDK build-tools（路径写在各 `build.sh` 顶部，按自己机器改）、Go 1.22+。
 
-装到车上：
+装到车上（包名 `com.xiaopeng.vdcast`，应用名「仪表投屏」）：
 
 ```bash
-bash tools/installapk.sh adbprobe/AdbProbe.apk com.probe.adbprobe adbprobe.apk
+bash tools/installapk.sh adbprobe/AdbProbe.apk com.xiaopeng.vdcast vdcast.apk
 ```
 
-这台 ROM 会拦 `adb install`（`isPlatSigned:false`），只能走图形安装器 + 键盘导航，脚本已经把这条路固化。
+这台 ROM 会拦 `adb install`（`isPlatSigned:false`），**与包名无关**，`com.xiaopeng.*` 同样被拒；只能走图形安装器 + 键盘导航，脚本已经把这条路固化。所以别再试 `adb install` / `pm install`，那不是环境坏了。
 
 ## 5. 运行
 
@@ -146,6 +146,35 @@ adb shell "echo '960,345,1440,426' > /data/local/tmp/vdcrop.txt"   # 车机侧�
 传 128KB 只落 65536 —— 都是这同一个 64KB socket 缓冲上限。往仪表送文件必须
 切块（本仓库用 `probe/pushmulti.py`，60000 字节/块），而且**每块都要校验落盘长度**，
 否则拼接出来的是错位文件，装上去只会 `Exec format error`。
+
+**这台 ROM 的 adbd 授权弹窗是单槽位，而且没有可见 UI。** 只要槽位里有一个遗留 pending，新的授权请求就会被 `prompt currently pending, skipping` 直接丢弃，8 秒后 host 变 offline；表现就是「某个需要 adb 的应用一直连不上 / unauthorized」。**这与本 APK 无关**：P7 SHOW 在本应用完全没运行时同样失败。处置与禁忌：
+
+- **这是可恢复状态，不是 ROM 坏了**。实测复位后同一通道能正常发 prompt、拿到 `OK`、正常释放（`sending prompt with id 17` → `adb client 17 authorized` → `no prompts to send`）；
+- 复位只有两条路：**重启车机**，或在开发者工具里把「无线 ADB」关掉再打开（触发 `sys.xp.adb.tcp.port=5050` → `stop/start adbd`）。shell 域写不了这个属性、也杀不掉 adbd；
+- 复位后确认 `service.adb.tcp.port=5050` 还在（它是运行时属性，重启后可能没自动回来）；
+- ⚠️ **别反复拿新公钥去试探**：每次试探都可能留下一张需要复位的 pending。正常的首次授权走一次就够。
+
+### 别人装这个包会怎样
+
+**不需要你把自己的 key 给别人，APK 里也没有任何内置密钥。**
+
+代码只在运行时读两个外部路径（`/data/local/tmp/vdcast_adbkey.der`、`/sdcard/Download/vdcast_adbkey.der`），这两个文件都不在安装包里。别人机器上没有它们，就会走标准路径：生成一把新的 2048 位 RSA → 首次连接发 `AUTH_RSAPUBLICKEY` → 车机授权 → 写入 `adb_keys` → 之后永久免授权。
+
+给别人的说明写四条就够：
+
+1. 只能走**图形安装器**（`adb install` 必被 `isPlatSigned:false` 拒绝，这是 ROM 限制，不是你环境坏了）；
+2. 首次点「连接」等一次授权，别连点；
+3. 如果一直超时连不上 → 开发者工具里「无线 ADB」关掉再打开，再连一次；
+4. 升级用**覆盖安装**，省掉这次重新授权。
+
+只有一种情况需要手动投放 key：**换包名**（新包的私有目录是新的）。那时把已授权的 `adbkey.der`（PKCS#8 DER）放到约定位置，应用会导入而不是生成新 key：
+
+```bash
+# adbkey 是 PKCS#8 DER（PC 上 ~/.android/adbkey 去掉 PEM 头尾再 base64 -d 即是）
+adb push adbkey.der /data/local/tmp/vdcast_adbkey.der
+```
+
+`Adb` 里也加了硬保护：一个进程内最多提交一次公钥，提交后仍无 CNXN 就放弃并明确报错。
 
 **`adb server` 会被周期性回收，脚本里的 adb 调用会静默失败。** 表现是
 `no devices/emulators found`，但被 `capture_output` 吞掉后只剩「一块都没传进去」。

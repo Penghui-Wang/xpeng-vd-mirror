@@ -12,8 +12,8 @@ mkdir -p out
 
 "$JAVAC" -encoding UTF-8 -nowarn -d out \
   android/util/Base64.java \
-  ../src/com/probe/adbprobe/Adb.java \
-  ../src/com/probe/adbprobe/Icrpc.java \
+  ../src/com/xiaopeng/vdcast/Adb.java \
+  ../src/com/xiaopeng/vdcast/Icrpc.java \
   MockAdbdTest.java
 
 "$JAVA" -cp out MockAdbdTest

@@ -1,4 +1,4 @@
-package com.probe.adbprobe;
+package com.xiaopeng.vdcast;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -618,7 +618,7 @@ public final class VdCtl {
         return new java.util.ArrayList<>(set);
     }
 
-    private static final String SELF = "com.probe.adbprobe";
+    private static final String SELF = "com.xiaopeng.vdcast";
 
     /** 目标包是否已经有窗口（有就不再重复拉起，避免把用户的界面顶掉） */
     public TaskInfo findTask(String pkg) throws IOException {

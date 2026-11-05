@@ -3,7 +3,7 @@
 //   1) 包头 data_check 必须为 0（>= A_VERSION_SKIP_CHECKSUM）
 //   2) 本 ROM adbd 认「token 当摘要」的签名，不认 AOSP 标准的先 SHA-1 再签
 // 见 Adb.java 的 SIGN_MODES 注释 与 docs/APK控制器-v0.2.md 的 v0.5 章节。这里只作留证，别再照着它排查。
-import com.probe.adbprobe.Adb;
+import com.xiaopeng.vdcast.Adb;
 
 import java.io.File;
 import java.nio.charset.StandardCharsets;

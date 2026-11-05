@@ -1,4 +1,4 @@
-package com.probe.adbprobe;
+package com.xiaopeng.vdcast;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
