@@ -76,8 +76,23 @@ public final class VdSend {
 
 
     // 源裁剪区（车机屏幕坐标）。默认对准 QQ 音乐 freeform 窗口 [960,0]-[2400,1080]
-    // 并按仪表中间带 1920x568 的比例取横条：1440 x 426
+    // 并按仪表中间带 1920x568 的比例取横条：1440 x 426。
+    //
+    // 框选坐标是「相对框选那一刻的 2/3 窗口」的；小鹏允许把 2/3 窗口放左或放右，
+    // 窗口原点会差 960px。真正抓屏前必须用 applyCropShift() 把 SRC_* 平移到目标
+    // 窗口当前所在的一侧，否则窗口在左栏时抓到的右半边是空桌面（画面异常）。
     static int SRC_X = 960, SRC_Y = 345, SRC_W = 1440, SRC_H = 426;
+    /** 文件里读出的原始裁切（未平移）；applyCropShift 每次从它重算，避免重复叠加 */
+    static int RAW_X = 960, RAW_Y = 345, RAW_W = 1440, RAW_H = 426;
+    /** 框选时目标窗口的 bounds {x,y,w,h}；没有基准文件时用宽高推断 */
+    static int[] cropBase;
+    /** 目标窗口最终落点（2/3 左栏或右栏）；null=没识别出来，不做平移 */
+    static volatile Rect paneRect;
+    static final String CROP_BASE_FILE = "/data/local/tmp/vdcrop.base";
+    static final String ORIG_FILE = "/data/local/tmp/vdorig.txt";
+    static String baseText = "";
+    static String paneLogged = "";
+    static long lastPanePollMs = 0;
 
     static volatile long frames = 0, sentFrames = 0, sentBytes = 0, capFrames = 0;
     static volatile int lastFps = 0;
@@ -117,7 +132,7 @@ public final class VdSend {
         if (targetFps < 1) targetFps = 30;
 
         // 独立恢复入口：kill -9 之后残留的搬移状态用这条清理。
-        // 必须幂等——主屏模式停止时窗口本来就在右栏，不能把用户正在用的界面拉到前台。
+        // 必须幂等——窗口本来就在左栏或右栏时不能把用户正在用的界面拉到前台。
         if (restoreOnly) {
             // B5：这里原来要 systemMain() 初始化 ActivityThread。但整个 restore 只用
             // `am` 命令行（exec）+ System.exit，一次 binder 都不发 —— 初始化白花 0.5~1s，去掉。
@@ -130,8 +145,10 @@ public final class VdSend {
             targetTaskId = t;
             int cur = taskDisplayOf(t);
             String b = taskBounds(t);
-            if (cur == 0 && boundsOk(b)) {
+            // 左栏、右栏都算干净的 2/3 状态；只有全屏/错位才需要修
+            if (cur == 0 && paneOf(b) != null) {
                 say("restore: nothing to do (display=0 bounds=" + b + ")");
+                clearOrig();
                 System.exit(0);
             }
             say("restore: fixing display=" + cur + " bounds=" + b);
@@ -141,7 +158,7 @@ public final class VdSend {
                 // 这里只做一次核实，没搬走再等 200ms 复查（最多 1 秒）。
                 for (int i = 0; i < 5 && taskDisplayOf(t) != 0; i++) sleep(200);
             }
-            restoreRightPane();
+            restorePane(origTarget());
             say("restore: done bounds=" + taskBounds(t));
             System.exit(0);
         }
@@ -163,13 +180,127 @@ public final class VdSend {
             String s = new String(java.nio.file.Files.readAllBytes(f.toPath()), "UTF-8").trim();
             String[] p = s.split("[,\\s]+");
             if (p.length >= 4) {
-                SRC_X = Integer.parseInt(p[0].trim());
-                SRC_Y = Integer.parseInt(p[1].trim());
-                SRC_W = Integer.parseInt(p[2].trim());
-                SRC_H = Integer.parseInt(p[3].trim());
+                RAW_X = Integer.parseInt(p[0].trim());
+                RAW_Y = Integer.parseInt(p[1].trim());
+                RAW_W = Integer.parseInt(p[2].trim());
+                RAW_H = Integer.parseInt(p[3].trim());
+                loadCropBase(s);
+                applyCropShift();
             }
         } catch (Throwable t) {
             say("loadCrop FAIL " + t);
+        }
+    }
+
+    /**
+     * vdcrop.base：首行是框选时的 crop 文本，次行是那会儿目标窗口的 bounds。
+     *
+     * 面板写裁切时顺手记下窗口在哪一栏；发送端据此知道「裁切框是相对哪一栏选的」。
+     * 首行和当前裁切对不上说明文件过期，宁可退回按宽高推断，也不能拿旧基准乱平移。
+     */
+    static void loadCropBase(String cropText) {
+        cropBase = null;
+        try {
+            File f = new File(CROP_BASE_FILE);
+            if (!f.exists()) return;
+            String s = new String(java.nio.file.Files.readAllBytes(f.toPath()), "UTF-8").trim();
+            String[] ln = s.split("\\r?\\n");
+            if (ln.length < 2) return;
+            String want = RAW_X + "," + RAW_Y + "," + RAW_W + "," + RAW_H;
+            if (!ln[0].trim().equals(want)) {
+                say("crop base stale (" + ln[0].trim() + " != " + want + ") -> infer");
+                return;
+            }
+            cropBase = parseInts(ln[1], 4);
+            if (cropBase != null) {
+                say("crop base window=" + cropBase[0] + "," + cropBase[1]
+                        + "," + cropBase[2] + "," + cropBase[3]);
+            }
+        } catch (Throwable t) {
+            say("loadCropBase FAIL " + t);
+        }
+    }
+
+    /**
+     * 把裁切框从「框选时那一栏」平移到目标窗口现在所在的那一栏。
+     *
+     * 基准优先级：
+     *  1) vdcrop.base 记录的窗口 bounds（最准，能处理窗口不在 0 起点）；
+     *  2) 裁切宽度≈1440：说明选的是整条 2/3 栏，x 就是窗口 x，y 取 0；
+     *  3) 其余：x≥480 猜框选时在右栏，否则左栏，y 取 0。
+     * 全屏框选（≈2400×1200）不平移 —— 用户要的就是整个屏幕。
+     */
+    static void applyCropShift() {
+        SRC_X = RAW_X;
+        SRC_Y = RAW_Y;
+        SRC_W = RAW_W;
+        SRC_H = RAW_H;
+        Rect pane = paneRect;
+        if (pane == null) return;
+        if (RAW_W >= VD_W - 200 && RAW_H >= VD_H - 200) return;
+        if (RAW_W <= 0 || RAW_H <= 0 || RAW_W > VD_W || RAW_H > VD_H) return;
+        // 没有基准记录时只对「和 2/3 栏同宽」的裁切做推断平移；1920 宽这类
+        // 自定义绝对裁切保持原样，免得平移后反而跑偏。
+        if (cropBase == null && (RAW_W < 1200 || RAW_W > 1700)) return;
+
+        int baseX, baseY;
+        if (cropBase != null) {
+            baseX = cropBase[0];
+            baseY = cropBase[1];
+        } else if (Math.abs(RAW_W - 1440) <= 120) {
+            baseX = RAW_X;
+            baseY = 0;
+        } else {
+            baseX = RAW_X >= 480 ? 960 : 0;
+            baseY = 0;
+        }
+        int dx = pane.left - baseX;
+        int dy = pane.top - baseY;
+        if (dx == 0 && dy == 0) return;
+        int nx = clamp(RAW_X + dx, 0, VD_W - RAW_W);
+        int ny = clamp(RAW_Y + dy, 0, VD_H - RAW_H);
+        SRC_X = nx;
+        SRC_Y = ny;
+        String sig = pane.left + "," + pane.top + " base=" + baseX + "," + baseY
+                + " crop=" + RAW_X + "," + RAW_Y + " -> " + nx + "," + ny;
+        if (!sig.equals(paneLogged)) {
+            paneLogged = sig;
+            say("crop follow pane " + sig);
+        }
+    }
+
+    static int clamp(int v, int lo, int hi) {
+        if (hi < lo) return lo;
+        return v < lo ? lo : (v > hi ? hi : v);
+    }
+
+    /** 解析 "[960,0][2400,1080]" / "960,0,2400,1080" 这类四段文本 */
+    static int[] parseInts(String s, int n) {
+        try {
+            String[] p = s.replace("[", " ").replace("]", " ").replace(",", " ").trim()
+                    .split("\\s+");
+            if (p.length < n) return null;
+            int[] v = new int[n];
+            for (int i = 0; i < n; i++) v[i] = Integer.parseInt(p[i]);
+            return v;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    static Rect parseRect(String s) {
+        int[] v = parseInts(s, 4);
+        if (v == null) return null;
+        if (v[2] <= v[0] || v[3] <= v[1]) return null;
+        return new Rect(v[0], v[1], v[2], v[3]);
+    }
+
+    static String readText(File f) {
+        try {
+            if (!f.exists()) return "";
+            return new String(java.nio.file.Files.readAllBytes(f.toPath()), "UTF-8").trim();
+        } catch (Throwable t) {
+            return "";
         }
     }
 
@@ -181,10 +312,13 @@ public final class VdSend {
             File f = new File(CROP_FILE);
             if (!f.exists()) return;
             String s = new String(java.nio.file.Files.readAllBytes(f.toPath()), "UTF-8").trim();
-            if (s.equals(cropText)) return;
+            // base 也要一起看：窗口换边后重选同一条裁切，crop 文本不变，只有 base 变
+            String b = readText(new File(CROP_BASE_FILE));
+            if (s.equals(cropText) && b.equals(baseText)) return;
             cropText = s;
+            baseText = b;
             loadCrop();
-            say("crop reload " + s);
+            say("crop reload " + s + (b.isEmpty() ? "" : " base=" + b.replace("\n", " | ")));
             rebuildArgs();
         } catch (Throwable ignored) { }
     }
@@ -419,29 +553,46 @@ public final class VdSend {
         int cur = taskDisplayOf(task);
         say("target task=" + task + " comp=" + targetComponent + " curDisplay=" + cur
                 + " bounds=" + taskBounds(task));
-        // 上次异常退出可能把它留在已销毁的虚拟屏上，先搬回主屏并恢复右栏。
-        // 注意：搬回主屏会被重新布局成全屏 [0,0][2400,1200]，必须用 freeform 重新拉起，
-        // 否则裁切区 960,345,1440,426 会落在全屏画面的大片空白上（压缩后只剩几 KB）。
+        // 上次异常退出可能把它留在已销毁的虚拟屏上，先搬回主屏并恢复栏位。
         if (cur > 0) {
-            say("task on display " + cur + " -> move back to 0 and restore right pane");
+            say("task on display " + cur + " -> move back to 0 and restore pane");
             moveTask(task, 0);
             // B5：同 restoreOnly 路径，把固定 sleep(1200) 换成一次核实
             for (int i = 0; i < 5 && taskDisplayOf(task) != 0; i++) sleep(200);
-            restoreRightPane();
+            restorePane(null);
         }
+        // 记住搬走前窗口在哪一栏：停止时按它还原；搬移不改布局，这个 bounds 就是
+        // 目标窗口在虚拟屏上的落点。左栏/右栏都认，只有全屏/错位才用右栏兜底。
+        String b0 = taskBounds(task);
+        Rect paneTarget = paneOf(b0);
+        if (paneTarget == null) paneTarget = new Rect(960, 0, 2400, 1080);
+        writeOrig(paneTarget);
         if (!moveTask(task, vdDisplayId)) {
             throw new RuntimeException("move-stack failed " + task + " -> " + vdDisplayId);
         }
-        say("task " + task + " moved to display " + vdDisplayId + " bounds=" + taskBounds(task));
-        // 搬移本身不改布局，但沿用上一步的全屏状态就会取错区域，这里兜底校正一次
-        if (!boundsOk(taskBounds(task))) {
-            say("bounds not right pane -> resize");
-            resizeTask(task, 960, 0, 2400, 1080);
-            // B5：固定 sleep(1500) 改成轮询到落位（最多 1.5 秒）
-            String bb = taskBounds(task);
-            for (int i = 0; i < 5 && !boundsOk(bb); i++) { sleep(200); bb = taskBounds(task); }
+        String bb = taskBounds(task);
+        say("task " + task + " moved to display " + vdDisplayId + " bounds=" + bb
+                + " want=" + paneTarget);
+        // 搬移本身不改布局，但若落点是全屏（例如窗口原本不是 2/3 栏）就 resize 回目标栏位
+        if (paneOf(bb) == null) {
+            say("bounds not a 2/3 pane -> resize to " + paneTarget);
+            resizeTask(task, paneTarget.left, paneTarget.top, paneTarget.right, paneTarget.bottom);
+            for (int i = 0; i < 6; i++) {
+                sleep(200);
+                bb = taskBounds(task);
+                if (paneOf(bb) != null) break;
+            }
             say("bounds after resize=" + bb);
         }
+        // 最终落点决定裁切框往左还是往右平移；识别不出来就保持默认右栏行为
+        paneRect = paneOf(bb);
+        if (paneRect == null) {
+            say("pane unknown (bounds=" + bb + "), crop not shifted");
+        } else {
+            say("pane follow " + paneRect.left + "," + paneRect.top
+                    + (paneRect.left < 480 ? " (left)" : " (right)"));
+        }
+        applyCropShift();
 
         // DMS 不暴露虚拟屏的 token，只能自建一个 shadow display 共享它的 layerStack
         android.os.IBinder tok = (android.os.IBinder) sc.getMethod("createDisplay",
@@ -468,24 +619,66 @@ public final class VdSend {
         return tok;
     }
 
-    /** 用 freeform 重新拉起，把窗口恢复成右栏 [960,0][2400,1080] */
-    static void restoreRightPane() {
+    /**
+     * 恢复成 2/3 栏。
+     *
+     * want 非空：停止投屏时用，尽量回到投屏前所在的那一栏（左/右都认）；
+     * want 为空：启动前清理残留时用，只要已经在左栏或右栏就不动。
+     * 两种情况都幂等，不会把用户正在用的窗口顶到前台。
+     */
+    static void restorePane(Rect want) {
         if (targetComponent == null) return;
+        dropStackCache();
+        String b = taskBounds(targetTaskId);
+        Rect cur = paneOf(b);
+        if (cur != null && (want == null || sameSide(cur, want))) {
+            say("pane already ok bounds=" + b);
+            if (want != null) clearOrig();
+            return;
+        }
         exec("am start -n " + targetComponent + " --windowingMode 5");
         dropStackCache();
-        // B5：原来这里是 sleep(2000) 等窗口自己落位，再判断、再 resize。
-        // 但 resize 是幂等的，而且它才是真正把窗口摆到右栏的那一步 ——
-        // 直接 resize 再核对，比「先等 2 秒再决定要不要 resize」快 2 秒左右。
-        resizeTask(targetTaskId, 960, 0, 2400, 1080);
-        String b = taskBounds(targetTaskId);
-        say("right pane restored bounds=" + b);
-        if (!boundsOk(b)) {
-            // 刚 start 完 task 可能还没进 freeform，resize 会被拒；补一次
-            sleep(400);
-            resizeTask(targetTaskId, 960, 0, 2400, 1080);
+        for (int i = 0; i < 6; i++) {
+            sleep(200);
             b = taskBounds(targetTaskId);
-            say("bounds after resize=" + b);
+            cur = paneOf(b);
+            if (cur != null && (want == null || sameSide(cur, want))) break;
         }
+        say("pane after freeform bounds=" + b);
+        if (cur == null || (want != null && !sameSide(cur, want))) {
+            // 投屏前记下的栏位优先；没有记录就按右栏兜底（兼容旧版本/首次升级）
+            Rect t = want != null ? want : origTarget();
+            resizeTask(targetTaskId, t.left, t.top, t.right, t.bottom);
+            for (int i = 0; i < 6; i++) {
+                sleep(200);
+                b = taskBounds(targetTaskId);
+                cur = paneOf(b);
+                if (cur != null && (want == null || sameSide(cur, want))) break;
+            }
+            say("pane after resize bounds=" + b);
+        }
+        if (cur != null && (want == null || sameSide(cur, want))) clearOrig();
+    }
+
+    /** 左栏/右栏判定：x 原点小于 480 视为左栏 */
+    static boolean sameSide(Rect a, Rect b) {
+        return (a.left < 480) == (b.left < 480);
+    }
+
+    /** 投屏前目标窗口的栏位，停止时按它还原 */
+    static void writeOrig(Rect r) {
+        exec("echo '" + r.left + "," + r.top + "," + r.right + "," + r.bottom
+                + "' > " + ORIG_FILE);
+    }
+
+    /** 读投屏前栏位；没有记录时按右栏兜底 */
+    static Rect origTarget() {
+        Rect r = parseRect(readText(new File(ORIG_FILE)));
+        return r != null ? r : new Rect(960, 0, 2400, 1080);
+    }
+
+    static void clearOrig() {
+        try { new File(ORIG_FILE).delete(); } catch (Throwable ignored) { }
     }
 
     /** 读 RootTask 的 bounds 字符串，如 [960,0][2400,1080] */
@@ -502,19 +695,20 @@ public final class VdSend {
         return "?";
     }
 
-    /** 是否还是右栏那块的尺寸（x≈960、宽≈1440）。全屏 [0,0][2400,1200] 判定为不合格 */
-    static boolean boundsOk(String b) {
-        try {
-            String[] p = b.replace("[", " ").replace("]", " ").replace(",", " ").trim()
-                    .split("\\s+");
-            if (p.length < 4) return false;
-            int x0 = Integer.parseInt(p[0]);
-            int x1 = Integer.parseInt(p[2]);
-            int w = x1 - x0;
-            return x0 > 800 && x0 < 1100 && w > 1200 && w < 1700;
-        } catch (Exception e) {
-            return false;
-        }
+    /**
+     * 解析 2/3 栏的 Rect。小鹏的 2/3 窗口可以左右切换，所以两种 x 原点都认；
+     * 全屏 [0,0][2400,1200]、1/3 左栏、以及正在拖动中的中间态都返回 null。
+     */
+    static Rect paneOf(String b) {
+        int[] v = parseInts(b, 4);
+        if (v == null) return null;
+        int x0 = v[0], y0 = v[1], x1 = v[2], y1 = v[3];
+        int w = x1 - x0, h = y1 - y0;
+        if (h < 1000 || h > 1200) return null;
+        if (w < 1200 || w > 1700) return null;
+        if (!((x0 >= -20 && x0 <= 220) || (x0 >= 780 && x0 <= 1120))) return null;
+        if (y0 < -20 || y0 > 220) return null;
+        return new Rect(x0, y0, x1, y1);
     }
 
     /**
@@ -589,7 +783,7 @@ public final class VdSend {
         return false;
     }
 
-    /** 幂等恢复：搬回主屏、还原右栏、销毁 shadow display、释放虚拟屏 */
+    /** 幂等恢复：搬回主屏、还原 2/3 栏位、销毁 shadow display、释放虚拟屏 */
     static void restoreAll() {
         synchronized (RESTORED) {
             if (restored) return;
@@ -600,8 +794,8 @@ public final class VdSend {
             try {
                 exec("am display move-stack " + targetTaskId + " 0");
                 sleep(2000);
-                // 搬回主屏会变成全屏，用 freeform 重新拉起才能恢复右栏宽度
-                restoreRightPane();
+                // 搬回主屏可能变成全屏，restorePane 会按投屏前的栏位还原（左/右都认）
+                restorePane(origTarget());
                 say("RESTORE task " + targetTaskId + " -> display 0");
             } catch (Throwable t) { say("RESTORE task FAIL " + t); }
         }
@@ -669,6 +863,7 @@ public final class VdSend {
             token = setupVirtualScreen(sc);
         } else {
             token = sc.getMethod("getInternalDisplayToken").invoke(null);
+            setupMainPane();
         }
         if (token == null) throw new RuntimeException("no display token");
         Class<?> bld = Class.forName("android.view.SurfaceControl$DisplayCaptureArgs$Builder");
@@ -687,6 +882,38 @@ public final class VdSend {
         Class<?> argsCls = Class.forName("android.view.SurfaceControl$DisplayCaptureArgs");
         mCap = sc.getMethod("captureDisplay", argsCls);
         say("capture ready (" + (VDMODE ? "vd display " + vdDisplayId : "main display") + ")");
+        rebuildArgs();
+    }
+
+    /**
+     * 主屏模式：目标窗口在主屏上也可能被切到左/右 2/3 栏，同样要平移裁切。
+     * 找不到窗口就维持默认行为（不平移）。
+     */
+    static void setupMainPane() {
+        int t = findRootTask(TARGET_PKG);
+        if (t <= 0) {
+            say("main mode: target task not found, crop not shifted");
+            return;
+        }
+        targetTaskId = t;
+        Rect p = paneOf(taskBounds(t));
+        if (p != null) {
+            paneRect = p;
+            say("main pane follow " + p.left + "," + p.top);
+            applyCropShift();
+        } else {
+            say("main mode: target not in a 2/3 pane, crop not shifted");
+        }
+    }
+
+    /** 运行中窗口被换到另一侧时，裁切跟着平移（5 秒一次，够跟上手动切换） */
+    static void pollPane() {
+        if (targetTaskId <= 0) return;
+        Rect p = paneOf(taskBounds(targetTaskId));
+        if (p == null) return;
+        if (p.equals(paneRect)) return;
+        paneRect = p;
+        applyCropShift();
         rebuildArgs();
     }
 
@@ -826,6 +1053,12 @@ public final class VdSend {
                 // 裁切热重载每 15 帧（约 0.5s）查一次，不必每帧都读文件
                 if ((tick++ % 15) == 0) {
                     maybeReloadCrop();
+                    // 运行中窗口被系统换边：5 秒查一次，跟上手动切换
+                    long nowMs = SystemClock.elapsedRealtime();
+                    if (VDMODE && nowMs - lastPanePollMs > 5000) {
+                        lastPanePollMs = nowMs;
+                        pollPane();
+                    }
                     if (new File(CAP_TRIG).exists()) {
                         try { new File(CAP_TRIG).delete(); } catch (Throwable ignored) { }
                         dumpWanted = true;

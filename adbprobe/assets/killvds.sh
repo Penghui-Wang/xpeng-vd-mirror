@@ -11,7 +11,7 @@
 # 这样只会命中真正的 app_process 实例，绝不会误伤 adb shell 或父进程。
 # 注意：调用方的命令行里不能再出现 "com.probe.asx.VdSend" 字面串，否则父 shell 会被列进来。
 MODE="$1"
-# 第二个参数是目标包名：恢复时要按它把窗口摆回右栏。不传则沿用历史默认值。
+# 第二个参数是目标包名：恢复时要按它把窗口摆回投屏前所在的左/右 2/3 栏。不传则沿用历史默认值。
 RESTORE_PKG="${2:-com.tencent.qqmusicpad}"
 n=0
 
@@ -72,11 +72,11 @@ fi
 
 # 关键：恢复不能靠被杀的进程跑 shutdown hook —— 实测 app_process 下的 ART 收到 SIGTERM
 # 直接终止，hook 一行都不会执行（vdsend.log 里没有 RESTORE 记录）。改成起一个独立进程
-# 做幂等恢复：窗口在右栏就什么都不做，被系统迁成全屏才修回去。
+# 做幂等恢复：窗口已在左/右 2/3 栏就什么都不做，被系统迁成全屏才按投屏前的栏位修回去。
 if [ -f /data/local/tmp/vd.dex ]; then
   CLASSPATH=/data/local/tmp/vd.dex app_process /system/bin \
     com.probe.asx.VdSend --restore --pkg "$RESTORE_PKG" 2>&1 \
-    | grep -E "restore:|right pane|bounds|resize" | sed 's/^/  /'
+    | grep -E "restore:|pane|bounds|resize" | sed 's/^/  /'
 fi
 
 # 还没走的就是挂住了，补刀

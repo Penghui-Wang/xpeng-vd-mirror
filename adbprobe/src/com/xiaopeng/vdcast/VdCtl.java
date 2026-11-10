@@ -208,6 +208,8 @@ public final class VdCtl {
     private static final String DEX = "/data/local/tmp/vd.dex";
     private static final String KILLVDS = "/data/local/tmp/killvds.sh";
     private static final String VDSEND_LOG = "/data/local/tmp/vdsend.log";
+    /** 框选时目标窗口的 bounds，发送端据此把裁切框平移到窗口当前所在的一侧 */
+    private static final String CROP_BASE = "/data/local/tmp/vdcrop.base";
     private static final String ICBIN = "/tmp/icrecv_dbg";
     private static final int PORT = 5560;
 
@@ -380,8 +382,10 @@ public final class VdCtl {
             // 当前填的裁切值落盘，否则用户改了输入框没点「应用」就直接启动，
             // 实际用的还是上一次的旧裁切 —— 这个坑踩过。
             if (cfg.crop != null && cfg.crop.matches("\\d+,\\d+,\\d+,\\d+")) {
+                cfg.crop = canonCrop(cfg.crop);
                 adb.exec("echo '" + cfg.crop + "' > /data/local/tmp/vdcrop.txt", 8000);
-                log.print("  裁切 " + cfg.crop + " 已写入 " + "/data/local/tmp/vdcrop.txt");
+                log.print("  裁切 " + cfg.crop + " 已写入 /data/local/tmp/vdcrop.txt"
+                        + "（窗口在左/右 2/3 栏自动跟随）");
             }
 
             if (step(1, 8, "推发送端 dex + 杀进程脚本")) return false;
@@ -999,15 +1003,72 @@ public final class VdCtl {
                 log.print("!! 裁切格式应为 x,y,w,h，例如 960,345,1440,426");
                 return false;
             }
+            c = canonCrop(c);
             cfg.crop = c;
+            // 先记「框选时窗口在哪一栏」，再写裁切：发送端热重载时若先看到新 base
+            // 而 crop 还是旧的，首行对不上会自动按宽高推断，不会用错基准。
+            writeCropBase(c);
             adb.exec("echo '" + c + "' > /data/local/tmp/vdcrop.txt", 10000);
             String back = adb.exec("cat /data/local/tmp/vdcrop.txt", 10000).trim();
-            log.print("裁切已设为 " + back + "（0.5s 内热生效）");
+            log.print("裁切已设为 " + back + "（0.5s 内热生效；窗口在左/右 2/3 栏会自动跟随）");
             return true;
         } catch (Throwable t) {
             log.print("!! 设置裁切失败: " + brief(t));
             return false;
         }
+    }
+
+    /**
+     * 记录「这次框选时目标窗口在哪一栏」。
+     *
+     * 发送端靠它把裁切框平移到窗口当前所在的一侧：窗口从右栏切到左栏时，
+     * 裁切框要整体左移 840（右栏原点 960 → 左栏原点 120），否则抓到的是右边的空桌面
+     * （左栏画面异常的根因）。
+     * 目标不在左/右 2/3 栏（全屏、1/3 栏、没运行）时不写，让发送端按宽高推断。
+     */
+    private void writeCropBase(String crop) {
+        try {
+            TaskInfo t = findTask(cfg.pkg);
+            int[] b = t == null ? null : parseBounds(t.bounds);
+            if (b == null || !isPaneBounds(b)) {
+                adb.exec("rm -f " + CROP_BASE, 5000);
+                return;
+            }
+            String line = b[0] + "," + b[1] + "," + b[2] + "," + b[3];
+            adb.exec("echo '" + crop + "' > " + CROP_BASE
+                    + "; echo '" + line + "' >> " + CROP_BASE, 8000);
+            log.print("  裁切基准窗口 " + line + "（" + (b[0] < 480 ? "左栏" : "右栏") + "）");
+        } catch (Throwable t) {
+            log.print("!! 记录裁切基准失败: " + brief(t));
+        }
+    }
+
+    private static String canonCrop(String c) {
+        String[] p = c.split(",");
+        return Integer.parseInt(p[0].trim()) + "," + Integer.parseInt(p[1].trim()) + ","
+                + Integer.parseInt(p[2].trim()) + "," + Integer.parseInt(p[3].trim());
+    }
+
+    private static int[] parseBounds(String s) {
+        if (s == null) return null;
+        try {
+            String[] p = s.replace("[", " ").replace("]", " ").replace(",", " ").trim()
+                    .split("\\s+");
+            if (p.length < 4) return null;
+            int[] v = new int[4];
+            for (int i = 0; i < 4; i++) v[i] = Integer.parseInt(p[i]);
+            return v;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** 左栏≈[120,0][1560,1080]，右栏≈[960,0][2400,1080]；全屏/1/3 栏不算 */
+    private static boolean isPaneBounds(int[] b) {
+        int w = b[2] - b[0], h = b[3] - b[1];
+        if (h < 1000 || h > 1200) return false;
+        if (w < 1200 || w > 1700) return false;
+        return (b[0] >= -20 && b[0] <= 220) || (b[0] >= 780 && b[0] <= 1120);
     }
 
     public String currentCrop() {

@@ -720,7 +720,7 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         r3.addView(btnReset);
         c2.addView(r3);
 
-        c2.addView(label("车机画面裁切  x, y, w, h（按投屏区比例锁框）"));
+        c2.addView(label("车机画面裁切  x, y, w, h（按投屏区比例锁框；窗口在左/右 2/3 栏自动跟随）"));
         LinearLayout r2 = row();
         cropEdit = input("960,345,1440,426");
         r2.addView(cropEdit, weight());

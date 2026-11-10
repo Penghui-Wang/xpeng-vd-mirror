@@ -82,7 +82,7 @@ WAIT=6
 A shell "CLASSPATH=$DEX setsid app_process /system/bin \
   com.probe.asx.VdSend --child --mode $MODE 1920 568 $FPS \
   > /data/local/tmp/vdsend.log 2>&1 & sleep $WAIT; \
-  grep -E 'child start|VD created|target task|moved to display|shadow display ready|capture ready|args crop|FAIL' \
+  grep -E 'child start|VD created|target task|moved to display|pane follow|crop follow pane|shadow display ready|capture ready|args crop|FAIL' \
   /data/local/tmp/vdsend.log | tail -8" 2>&1 | tail -10
 
 echo "[6/7] 等 10 秒看端到端速率"
@@ -102,6 +102,6 @@ fi
 
 echo
 echo "调裁切区: echo 'x,y,w,h' > 车机 /data/local/tmp/vdcrop.txt（热生效，无需重启）"
-echo "         默认 960,345,1440,426（QQ音乐 freeform 窗口 [960,0]-[2400,1080] 的横条）"
-echo "停止投屏: bash stopcast.sh（vd 模式会等窗口搬回主屏）"
+echo "         默认 960,345,1440,426（右栏 [960,0]-[2400,1080] 的横条；窗口在左栏会自动左移）"
+echo "停止投屏: bash stopcast.sh（vd 模式会等窗口搬回主屏并还原左/右栏位）"
 echo "看状态  : bash status.sh"
