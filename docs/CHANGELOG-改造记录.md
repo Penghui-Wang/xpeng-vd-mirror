@@ -3,6 +3,38 @@
 > 与 `docs/审计-四类改造-答复与需求确认-v1.md` 的批次一一对应。
 > 每条记录「改了什么 / 怎么验的 / 还有什么没做」，便于回滚与交接。
 
+## v2.2.1：2/3 窗口切到左栏时画面异常（2026-11-10 23:46）
+
+### 改了什么
+
+| 文件 | 变更 |
+|---|---|
+| `asx/src/com/probe/asx/VdSend.java` | 裁切拆 `RAW_*`/`SRC_*`；`paneOf()` 同时认左栏（原点 120）与右栏（960）；`applyCropShift()` 按窗口当前栏位整体平移；运行中每 5s `pollPane()` 复查；`restorePane(want)` 按 `vdorig.txt` 还原投屏前栏位；删除只认右栏的 `boundsOk()` |
+| `adbprobe/src/com/xiaopeng/vdcast/VdCtl.java` | `setCrop` 先写 `vdcrop.base`（框选时窗口 bounds）再写裁切；`canonCrop`；`isPaneBounds` |
+| `MainActivity.java` | 裁切输入框 label 说明「窗口在左/右 2/3 栏自动跟随」 |
+| `tools/startcast.sh`、`tools/remote/killvds.sh` | 启动日志 grep 加 `pane follow|crop follow pane`；帮助/注释改左/右栏 |
+| `docs/虚拟屏模式-生产化.md` | 记左栏实测原点 120（不是 0）、平移 840、`vdcrop.base` 基准、5s 跟随、还原语义 |
+| `adbprobe/assets/vd.dex`、`assets/killvds.sh` | 随源码重建 |
+
+### 怎么验的
+
+| 项 | 结果 |
+|---|---|
+| 左栏投屏 | `pane follow 120,0 (left)`、`crop follow pane ... -> 120,26`；仪表 730×523 正常，61 fps |
+| 运行中换边 | `am task resize` 到右栏后约 5s 跟随到 `960,26` |
+| 停止还原 | 左栏进左栏出、右栏进右栏出；`vdorig.txt` 自动清理，VD 销毁 |
+| 默认裁切 | 无 base 文件时 `960,345` 推断为 `120,345`，按仪表比例扩成 1440×1032 |
+| 构建 | `asx/build.sh` dex 81,620 B；`adbprobe/build.sh` APK 1,451,042 B，v2/v3 签名 |
+
+### 没做的
+
+- 1/3 栏（宽约 826）与全屏不做平移；换边依赖 5s 轮询，最长 5s 旧画面。
+- 面板「应用」裁切时若窗口与裁切不同栏，以框选时窗口为平移基准（几何一致，但看到的可能仍是空桌面），重框一次即可。
+
+### 回滚
+
+`git revert ba6a431`；或覆盖安装 v2.2.0 的 APK。
+
 ## B5 收口 + 两个实车问题（2026-11-05 19:45）
 
 ### 改了什么
