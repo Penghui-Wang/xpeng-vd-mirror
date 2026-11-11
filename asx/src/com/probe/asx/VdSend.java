@@ -59,8 +59,15 @@ public final class VdSend {
     static final String HOST = "172.20.1.40";
     static final int PORT = 5560;
 
-    /** 虚拟屏尺寸必须与主屏一致：setDisplayProjection 的缩放不生效，影子 display 只做 1:1 裁切 */
-    static final int VD_W = 2400, VD_H = 1200;
+    /**
+     * 虚拟屏尺寸。默认与主屏一致（2400×1200）。
+     *
+     * <p>可以在面板里改成别的尺寸（例如 1920×720 = 仪表同尺寸）：应用会按虚拟屏的
+     * dp 配置重新布局，铺满整块虚拟屏；裁切/投影都按这个尺寸算，1:1 时不缩放更清晰。
+     */
+    static int VD_W = 2400, VD_H = 1200;
+    /** 全屏模式：不强制 2/3 栏，应用铺满整个虚拟屏 */
+    static boolean FULL = false;
 
     // ---------- 虚拟屏模式状态 ----------
     static boolean VDMODE = false;
@@ -119,10 +126,21 @@ public final class VdSend {
                 continue;
             }
             if ("--restore".equals(a)) { restoreOnly = true; continue; }
+            if ("--full".equals(a)) { FULL = true; continue; }
+            if ("--vdw".equals(a) && i + 1 < args.length) {
+                try { VD_W = Integer.parseInt(args[++i].trim()); } catch (Exception ignored) { }
+                continue;
+            }
+            if ("--vdh".equals(a) && i + 1 < args.length) {
+                try { VD_H = Integer.parseInt(args[++i].trim()); } catch (Exception ignored) { }
+                continue;
+            }
             if (k < 3) {
                 try { nums[k++] = Integer.parseInt(a); } catch (Exception ignored) { }
             }
         }
+        VD_W = clamp(VD_W, 640, 3840);
+        VD_H = clamp(VD_H, 360, 2160);
         if (k > 0) w = nums[0];
         if (k > 1) h = nums[1];
         if (k > 2) targetFps = nums[2];
@@ -235,6 +253,11 @@ public final class VdSend {
         SRC_Y = RAW_Y;
         SRC_W = RAW_W;
         SRC_H = RAW_H;
+        if (FULL) {
+            // 全屏模式：按窗口真实帧取景，再夹用户框选（不跟随 2/3 栏）
+            applyFullCrop();
+            return;
+        }
         Rect pane = paneRect;
         if (pane == null) return;
         if (RAW_W >= VD_W - 200 && RAW_H >= VD_H - 200) return;
@@ -295,6 +318,39 @@ public final class VdSend {
         return new Rect(v[0], v[1], v[2], v[3]);
     }
 
+    /**
+     * 取目标包面积最大的那个窗口的 mFrame（窗口真实帧）。
+     *
+     * 车机 WM 把窗口摆进 2/3 栏时，`am task resize` 只改 task bounds、不改窗口帧；
+     * 全屏模式如果直接按整块虚拟屏取画面，就会出现「左边一条黑、右边被切掉」。
+     * 同一个包可能同时有启动页/悬浮窗，取面积最大的那个才是主窗口。
+     */
+    static Rect winFrame(String pkg) {
+        try {
+            String dump = exec("dumpsys window windows");
+            if (dump == null || dump.isEmpty()) return null;
+            boolean in = false;
+            Rect best = null;
+            for (String ln : dump.split("\n")) {
+                String s = ln.trim();
+                if (s.startsWith("Window #")) {
+                    in = s.contains(pkg + "/");
+                    continue;
+                }
+                if (in && s.startsWith("mFrame=")) {
+                    in = false;   // 只看该窗口的第一条 mFrame（后面是历史帧）
+                    Rect r = parseRect(s.substring(7));
+                    if (r != null && (best == null
+                            || (long) r.width() * r.height() > (long) best.width() * best.height())) {
+                        best = r;
+                    }
+                }
+            }
+            return best;
+        } catch (Throwable ignored) { }
+        return null;
+    }
+
     static String readText(File f) {
         try {
             if (!f.exists()) return "";
@@ -308,6 +364,7 @@ public final class VdSend {
     static String cropText = null;
 
     static void maybeReloadCrop() {
+        if (FULL) return;   // 全屏模式裁切固定为整块虚拟屏
         try {
             File f = new File(CROP_FILE);
             if (!f.exists()) return;
@@ -328,6 +385,8 @@ public final class VdSend {
             String cmd = "CLASSPATH=" + DEX
                     + " setsid app_process /system/bin com.probe.asx.VdSend --child "
                     + (VDMODE ? "--mode vd --pkg " + TARGET_PKG + " " : "")
+                    + (FULL ? "--full " : "")
+                    + "--vdw " + VD_W + " --vdh " + VD_H + " "
                     + w + " " + h + " " + fps
                     + " > " + LOG + " 2>&1 &";
             new ProcessBuilder("/system/bin/sh", "-c", cmd).redirectErrorStream(true).start();
@@ -555,15 +614,35 @@ public final class VdSend {
                 + " bounds=" + taskBounds(task));
         // 上次异常退出可能把它留在已销毁的虚拟屏上，先搬回主屏并恢复栏位。
         if (cur > 0) {
-            say("task on display " + cur + " -> move back to 0 and restore pane");
+            say("task on display " + cur + " -> move back to 0");
             moveTask(task, 0);
-            // B5：同 restoreOnly 路径，把固定 sleep(1200) 换成一次核实
             for (int i = 0; i < 5 && taskDisplayOf(task) != 0; i++) sleep(200);
-            restorePane(null);
+            if (!FULL) restorePane(null);   // 全屏模式不摆 2/3 栏
         }
-        // 记住搬走前窗口在哪一栏：停止时按它还原；搬移不改布局，这个 bounds 就是
-        // 目标窗口在虚拟屏上的落点。左栏/右栏都认，只有全屏/错位才用右栏兜底。
+        // 记住搬走前的 bounds：停止时按它还原（全屏就还原成全屏，2/3 栏就还原成那一栏）。
         String b0 = taskBounds(task);
+        Rect orig = parseRect(b0);
+        if (FULL) {
+            // 全屏模式：不摆 2/3 栏，应用铺满整块虚拟屏。
+            writeOrig(orig != null ? orig : new Rect(0, 0, 2400, 1200));
+            if (!moveTask(task, vdDisplayId)) {
+                throw new RuntimeException("move-stack failed " + task + " -> " + vdDisplayId);
+            }
+            Rect want = new Rect(0, 0, VD_W, VD_H);
+            if (!want.equals(parseRect(taskBounds(task)))) {
+                say("full: resize to " + VD_W + "x" + VD_H);
+                resizeTask(task, 0, 0, VD_W, VD_H);
+                for (int i = 0; i < 6; i++) {
+                    sleep(200);
+                    if (want.equals(parseRect(taskBounds(task)))) break;
+                }
+            }
+            paneRect = null;
+            // 以窗口真实帧为准，再夹用户框选：窗口没全屏时（仍在 2/3 栏）也不会左黑右缺
+            applyFullCrop();
+            sleep(300);          // 等 WM 把窗口帧落到位，再刷一次
+            applyFullCrop();
+        } else {
         Rect paneTarget = paneOf(b0);
         if (paneTarget == null) paneTarget = new Rect(960, 0, 2400, 1080);
         writeOrig(paneTarget);
@@ -593,6 +672,7 @@ public final class VdSend {
                     + (paneRect.left < 480 ? " (left)" : " (right)"));
         }
         applyCropShift();
+        }
 
         // DMS 不暴露虚拟屏的 token，只能自建一个 shadow display 共享它的 layerStack
         android.os.IBinder tok = (android.os.IBinder) sc.getMethod("createDisplay",
@@ -628,6 +708,17 @@ public final class VdSend {
      */
     static void restorePane(Rect want) {
         if (targetComponent == null) return;
+        // 投屏前就是全屏（2400×1200）：搬回主屏后保持全屏，不要再摆 2/3 栏
+        if (isFullBounds(want)) {
+            Rect cur = parseRect(taskBounds(targetTaskId));
+            if (cur == null || !isFullBounds(cur)) {
+                resizeTask(targetTaskId, 0, 0, 2400, 1200);
+                sleep(400);
+            }
+            say("pane: original fullscreen, keep bounds=" + taskBounds(targetTaskId));
+            clearOrig();
+            return;
+        }
         dropStackCache();
         String b = taskBounds(targetTaskId);
         Rect cur = paneOf(b);
@@ -663,6 +754,11 @@ public final class VdSend {
     /** 左栏/右栏判定：x 原点小于 480 视为左栏 */
     static boolean sameSide(Rect a, Rect b) {
         return (a.left < 480) == (b.left < 480);
+    }
+
+    /** 是否是一整块主屏（2400×1200 这类）——用来判定投屏前是否全屏 */
+    static boolean isFullBounds(Rect r) {
+        return r != null && r.width() >= 2200 && r.height() >= 1100;
     }
 
     /** 投屏前目标窗口的栏位，停止时按它还原 */
@@ -794,8 +890,13 @@ public final class VdSend {
             try {
                 exec("am display move-stack " + targetTaskId + " 0");
                 sleep(2000);
-                // 搬回主屏可能变成全屏，restorePane 会按投屏前的栏位还原（左/右都认）
-                restorePane(origTarget());
+                if (FULL) {
+                    say("RESTORE full mode: keep bounds=" + taskBounds(targetTaskId));
+                    clearOrig();
+                } else {
+                    // 搬回主屏可能变成全屏，restorePane 会按投屏前的栏位还原（左/右都认）
+                    restorePane(origTarget());
+                }
                 say("RESTORE task " + targetTaskId + " -> display 0");
             } catch (Throwable t) { say("RESTORE task FAIL " + t); }
         }
@@ -908,6 +1009,7 @@ public final class VdSend {
 
     /** 运行中窗口被换到另一侧时，裁切跟着平移（5 秒一次，够跟上手动切换） */
     static void pollPane() {
+        if (FULL) { pollFullWindow(); return; }
         if (targetTaskId <= 0) return;
         Rect p = paneOf(taskBounds(targetTaskId));
         if (p == null) return;
@@ -916,6 +1018,59 @@ public final class VdSend {
         applyCropShift();
         rebuildArgs();
     }
+
+    /** 全屏模式下跟随窗口帧：用户中途把应用拖到全屏（或拖回 2/3 栏）时重新取景。 */
+    static void pollFullWindow() {
+        int ox = SRC_X, oy = SRC_Y, ow = SRC_W, oh = SRC_H;
+        applyFullCrop();
+        if (ox != SRC_X || oy != SRC_Y || ow != SRC_W || oh != SRC_H) rebuildArgs();
+    }
+
+    /**
+     * 全屏模式取景：窗口真实帧 ∩ 用户框选。
+     *
+     * 不能盲抓整块虚拟屏：车机 WM 有时只把 task 放大、窗口帧还留在 2/3 栏，
+     * 抓整块 VD 就会出现「左边一条黑、右边被切」。窗口帧是唯一可信的边界。
+     * 用户框选（vdcrop.txt）有效时，在窗口帧内再裁一层，做到框选所见即所得；
+     * 框选本来就是整块屏、或与窗口不相交时，退回整个窗口帧。
+     */
+    static void applyFullCrop() {
+        int vl = 0, vt = 0, vr = VD_W, vb = VD_H;
+        Rect wf = winFrame(TARGET_PKG);
+        if (wf != null) {
+            vl = clamp(wf.left, 0, VD_W - 16);
+            vt = clamp(wf.top, 0, VD_H - 16);
+            vr = clamp(wf.right, vl + 16, VD_W);
+            vb = clamp(wf.bottom, vt + 16, VD_H);
+        }
+        boolean box = RAW_W > 0 && RAW_H > 0
+                && !(RAW_W >= VD_W - 40 && RAW_H >= VD_H - 40);
+        if (box) {
+            int l = Math.max(RAW_X, vl), t = Math.max(RAW_Y, vt);
+            int r = Math.min(RAW_X + RAW_W, vr), b = Math.min(RAW_Y + RAW_H, vb);
+            if (r - l >= 160 && b - t >= 160) {
+                vl = l;
+                vt = t;
+                vr = r;
+                vb = b;
+            }
+        }
+        int nw = vr - vl, nh = vb - vt;
+        SRC_X = vl;
+        SRC_Y = vt;
+        SRC_W = nw;
+        SRC_H = nh;
+        String sig = vl + "," + vt + " " + nw + "x" + nh + " wf=" + (wf == null ? "?" : wf);
+        if (!sig.equals(fullLogged)) {
+            fullLogged = sig;
+            say("full mode window=" + (wf == null ? "unknown" : wf.toString())
+                    + " crop=" + nw + "x" + nh + " @" + vl + "," + vt
+                    + (box ? " box=" + RAW_X + "," + RAW_Y + " " + RAW_W + "x" + RAW_H : "")
+                    + (isFullBounds(wf) ? "" : " (window not fullscreen)"));
+        }
+    }
+
+    static String fullLogged = "";
 
     // 只在裁切区变化时重建，不要每帧重建——每帧重建还会顺带写一行日志，
     // 30fps 下光日志 IO 就能吃掉几毫秒（旧版本 vdsend.log 里 19000 条 args crop 就是它）。

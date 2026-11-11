@@ -138,6 +138,14 @@ public final class VdCtl {
         public int bot = 80;
         public String pkg = "com.tencent.qqmusicpad";
         public String crop = "960,345,1440,426";   // x,y,w,h（车机屏幕绝对坐标）
+        /**
+         * 全屏投屏：目标应用先拖到全屏，搬进虚拟屏后不再强制 2/3 栏，整块虚拟屏都取。
+         * 发送端实测：窗口本身是全屏（mFrame=[0,0][2400,1200]）时搬过去仍全屏；
+         * 只是 task bounds 是全屏、窗口还是 2/3 时，全屏模式抓到的就是 2/3 画面。
+         */
+        public boolean full = false;
+        /** 虚拟屏尺寸（全屏模式才用；2/3 模式固定按车机原尺寸建，避免窗口被裁） */
+        public int vdW = 2400, vdH = 1200;
         public String carIpFallback = "172.20.1.45";
         /** 本地预览端口：发送端在 127.0.0.1 上多播原始 565 帧，APK 的预览页连它 */
         public int previewPort = 5570;
@@ -183,6 +191,10 @@ public final class VdCtl {
             }
             outW = cW;
             outH = cH;
+            if (vdW < 640) vdW = 640;
+            if (vdW > 3840) vdW = 3840;
+            if (vdH < 360) vdH = 360;
+            if (vdH > 2160) vdH = 2160;
         }
 
         /** 投屏区像素数，用于按面积判断帧率预期（见 docs/B0-基线数据-v1.md §7） */
@@ -415,6 +427,7 @@ public final class VdCtl {
                             "确认它已安装、并且手动打开过一次（有的车机应用不允许后台拉起）；"
                                     + "或点「目标应用 → 更换」换一个可投的");
                 }
+                if (cfg.full) warnIfNotFullscreen();
             }
 
             if (step(4, 8, "确保仪表端 " + ICBIN)) return false;
@@ -1071,6 +1084,31 @@ public final class VdCtl {
         return (b[0] >= -20 && b[0] <= 220) || (b[0] >= 780 && b[0] <= 1120);
     }
 
+    /** 窗口本身是否已经全屏（2400×1200 量级）；只 task 全屏、窗口还是 2/3 时不算 */
+    private static boolean isFullBounds(int[] b) {
+        if (b == null) return false;
+        return b[2] - b[0] >= 2200 && b[3] - b[1] >= 1100;
+    }
+
+    /**
+     * 全屏模式启动前的体检：发送端会按「窗口实际帧」取画面，所以 2/3 栏也能直接投，
+     * 只是画面是 2/3 大小、不会铺满整块虚拟屏。想铺满就让用户先把应用拖到全屏。
+     */
+    private void warnIfNotFullscreen() {
+        try {
+            TaskInfo t = findTask(cfg.pkg);
+            int[] b = t == null ? null : parseBounds(t.bounds);
+            if (b != null && !isFullBounds(b)) {
+                log.print("  目标应用当前不是全屏（bounds=" + t.bounds + "）");
+                log.print("  全屏投屏会按窗口实际大小取画面（左/右 2/3 栏都不会黑边）；想铺满整块虚拟屏，先把应用拖到全屏");
+            } else if (b != null) {
+                log.print("  目标应用已是全屏 " + t.bounds + "，全屏模式按整块虚拟屏取画面");
+            }
+        } catch (Throwable t) {
+            log.print("!! 全屏体检失败: " + brief(t));
+        }
+    }
+
     public String currentCrop() {
         try {
             return adb.exec("cat /data/local/tmp/vdcrop.txt 2>/dev/null", 8000).trim();
@@ -1325,6 +1363,7 @@ public final class VdCtl {
     private void launchSender() throws IOException {
         String cmd = "CLASSPATH=" + DEX + " setsid app_process /system/bin com.probe.asx.VdSend "
                 + "--child --mode " + cfg.mode + " --pkg " + cfg.pkg + " "
+                + (cfg.full ? "--full --vdw " + cfg.vdW + " --vdh " + cfg.vdH + " " : "")
                 + cfg.outW + " " + cfg.outH + " " + cfg.fps
                 + (cfg.previewPort > 0 ? " --preview " + cfg.previewPort : "")
                 + " > " + VDSEND_LOG + " 2>&1 & echo LAUNCHED; sleep 0.5";

@@ -13,6 +13,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
@@ -60,6 +61,8 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
     private EditText portEdit;
     private EditText pkgEdit;
     private EditText clusterEdit;
+    /** 全屏投屏开关（配合「把应用拖到全屏」使用；勾选后发送端不再强制 2/3 栏） */
+    private CheckBox fullBox;
     private Button btnStartVd, btnStartMain, btnStop, btnStatus, btnCrop, btnProbe, btnPick, btnFrame, btnCluster, btnPreview;
     /** 退出入口（UI-08）与日志折叠开关 */
     private Button btnExit, btnLogToggle;
@@ -91,6 +94,7 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
 
         SharedPreferences sp = getPreferences(MODE_PRIVATE);
         cropEdit.setText(sp.getString("crop", "960,345,1440,426"));
+        fullBox.setChecked(sp.getBoolean("full", false));
         portEdit.setText(sp.getString("port", String.valueOf(PORT_DEFAULT)));
         pkgEdit.setText(sp.getString("pkg", PKG_DEFAULT));
         if (clusterEdit != null) {
@@ -250,6 +254,12 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
                 if (pkgEdit.getText().toString().trim().isEmpty()) {
                     print("!! act=start 需要 --es pkg（或先 act=pick 选一个）");
                     break;
+                }
+                // --es full 1：全屏投屏（目标应用已拖到全屏时用）
+                String fulls = opt(it, "full");
+                if (fulls != null) {
+                    fullBox.setChecked("1".equals(fulls.trim())
+                            || "true".equalsIgnoreCase(fulls.trim()));
                 }
                 final String m = mode;
                 run(() -> startWith(m));
@@ -729,6 +739,15 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         r2.addView(btnFrame);
         r2.addView(btnCrop);
         c2.addView(r2);
+
+        // 全屏投屏：车机分屏 WM 只认「用户拖到全屏」后的窗口帧，am task resize 改不动；
+        // 所以这个开关的语义是「我已经把应用拖全屏了，别再按 2/3 栏校准」。
+        fullBox = new CheckBox(this);
+        fullBox.setText("全屏投屏（目标应用先拖到全屏；勾选后不再强制 2/3 栏，整块虚拟屏都取）");
+        fullBox.setTextSize(TypedValue.COMPLEX_UNIT_PX, 28);
+        fullBox.setTextColor(0xFFE8EAED);
+        fullBox.setPadding(0, dp(8), 0, 0);
+        c2.addView(fullBox);
         body.addView(c2);
 
         // ---------- 卡片 3：预演 → 主 CTA ----------
@@ -1790,6 +1809,7 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
         ctl.cfg().mode = mode;
         ctl.cfg().pkg = pkg;
         ctl.cfg().crop = cropEdit.getText().toString().trim();
+        ctl.cfg().full = fullBox != null && fullBox.isChecked();
         applyClusterCfg();
         savePrefs();
         lastMode = mode;
@@ -2068,6 +2088,7 @@ public class MainActivity extends Activity implements Adb.Log, VdCtl.Log {
                         : clusterEdit.getText().toString().trim())
                 .putString("port", portEdit.getText().toString().trim())
                 .putString("pkg", pkgEdit.getText().toString().trim())
+                .putBoolean("full", fullBox != null && fullBox.isChecked())
                 .apply();
     }
 

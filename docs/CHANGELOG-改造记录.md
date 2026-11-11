@@ -3,6 +3,39 @@
 > 与 `docs/审计-四类改造-答复与需求确认-v1.md` 的批次一一对应。
 > 每条记录「改了什么 / 怎么验的 / 还有什么没做」，便于回滚与交接。
 
+## v2.2.2：全屏投屏 + 全屏取景/框选对齐（2026-11-12 00:20）
+
+### 改了什么
+
+| 文件 | 变更 |
+|---|---|
+| `asx/src/com/probe/asx/VdSend.java` | 新增 `--full`/`--vdw`/`--vdh`：全屏模式不再强制 2/3 栏；`winFrame(pkg)` 从 `dumpsys window` 取同包面积最大的窗口帧；`applyFullCrop()` 用「窗口帧 ∩ 用户框选」当裁切源；`pollFullWindow()` 每 5s 跟随窗口帧；`restorePane(want)` 识别投屏前全屏并保持全屏 |
+| `adbprobe/src/com/xiaopeng/vdcast/VdCtl.java` | `Cfg.full`/`vdW`/`vdH`；`launchSender` 追加 `--full --vdw --vdh`；`warnIfNotFullscreen()` 提示语改为「按窗口实际大小取画面」 |
+| `MainActivity.java` | 新增「全屏投屏」勾选框；`act=start --es full 1` |
+| `tools/installapk.sh` | 页面识别（uiautomator dump）；按键序列改为车机侧 `setsid` 脚本一次跑完；`before` 为空重试防假成功；轮询 `lastUpdateTime` 22s |
+| `adbprobe/assets/vd.dex`、`assets/icrecv_dbg` | 随源码重建 |
+
+### 怎么验的
+
+| 项 | 结果 |
+|---|---|
+| 全屏窗口 + 勾全屏 | 日志 `full mode bounds=[0,0][2400,1200] window=Rect(0, 0 - 2400, 1200)`；仪表 1920×720 铺满 |
+| 2/3 窗口 + 勾全屏 | `full mode window=Rect(960, 0 - 2400, 1080) crop=1440x1080 (window not fullscreen)`；画面无左黑、右侧不切 |
+| 框选一致性 | 框 `751,64,1501×1009` → `args crop=Rect(751, 64 - 2252, 1073)`；仪表上就是框里那块 |
+| 停止还原 | 全屏进全屏出；2/3 栏进同栏出 |
+| 1920×720 虚拟屏 | 百度/高德都不自适应（窗口仍 2400×1200 被裁），不做预设 |
+| 构建 | `asx/build.sh` dex 84,240 B；`adbprobe/build.sh` APK 1,455,138 B，v2/v3 签名 |
+
+### 没做的
+
+- 车机 WM 只按 2/3 栏摆放窗口，`am task resize` 改不了窗口帧；真全屏仍需用户手动拖一次，或应用自己请求全屏。
+- 1920×720 虚拟屏会让 2400×1200 的窗口被裁，未做预设；要支持需应用自适应。
+- 运行中拖全屏/换栏仍是 5s 轮询，最长 5s 旧画面。
+
+### 回滚
+
+`git revert <v2.2.2 提交>`；或覆盖安装 v2.2.1 的 APK。
+
 ## v2.2.1：2/3 窗口切到左栏时画面异常（2026-11-10 23:46）
 
 ### 改了什么
